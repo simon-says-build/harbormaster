@@ -1,0 +1,27 @@
+{
+  "//": "Copy to ~/.config/firebase-ports.json and edit. Each project gets a distinct port block. Pin each project's hub/logging in its firebase.json to a private lane so multiple suites coexist.",
+
+  "myapp": {
+    "path": "/absolute/path/to/myapp",
+    "cwd": "/absolute/path/to/myapp/functions",
+    "project_id": "myapp-firebase-project-id",
+    "only": ["auth", "firestore", "storage"],
+    "firestore": 8080,
+    "auth": 9099,
+    "storage": 9199,
+    "functions": 5001,
+    "ui": 4000
+  },
+
+  "myapp-e2e": {
+    "//": "A second, isolated instance for e2e — distinct ports + its own config (firebase.e2e.json with distinct hub/logging) so it runs alongside dev without clobbering its data.",
+    "path": "/absolute/path/to/myapp",
+    "cwd": "/absolute/path/to/myapp/functions",
+    "config": "firebase.e2e.json",
+    "project_id": "myapp-firebase-project-id",
+    "firestore": 8081,
+    "auth": 9098,
+    "storage": 9198,
+    "ui": 4001
+  }
+}
