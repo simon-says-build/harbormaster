@@ -906,14 +906,23 @@ def cmd_release(lease_id):
 
 
 def cmd_ports(project, fmt="human"):
-    if not project or not _broker_up():
-        print("broker not running", file=sys.stderr)
+    if not project:
+        print("usage: firebase-ports ports <project>", file=sys.stderr)
         sys.exit(1)
-    status, out = _broker_call("GET", f"/ports/{project}")
-    if status != 200:
-        print(f"no ports known for {project}", file=sys.stderr)
+    # Prefer the broker (live lease status), but fall back to the registry so
+    # discovery is a reliable file-read — consumers can always resolve ports/id
+    # without a running broker.
+    if _broker_up():
+        status, out = _broker_call("GET", f"/ports/{project}")
+        if status == 200:
+            _print_ports(out["ports"], fmt, up=out.get("up"), project_id=out.get("projectId"))
+            return
+    _, config = find_project(load_registry(), project)
+    ports = _emulator_ports(config)
+    if not ports:
+        print(f"no ports configured for '{project}' in the registry", file=sys.stderr)
         sys.exit(1)
-    _print_ports(out["ports"], fmt, up=out.get("up"), project_id=out.get("projectId"))
+    _print_ports(ports, fmt, up=None, project_id=_resolve_project_id(config))
 
 
 def cmd_allocate(ttl=DEFAULT_TTL, label=None, fmt="human"):
