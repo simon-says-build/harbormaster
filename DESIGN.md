@@ -1,8 +1,9 @@
 # firebase-ports — design (v2: caller-owned sandboxes)
 
-Status: **spec + WIP code on branch `registry-free-v2`. Not yet validated** (needs a
-quiet machine — the live agent-qa daemon shares the pool and the box was at load ~35
-during authoring). The live tool remains the v1 registry version on `main`.
+Status: **live on `main`.** Caller-owned sandboxes are the shipped model. Validated
+end-to-end: acquire/exec boot + owner-death reap + PID-reuse guard, and concurrent
+same-project suites coexist with isolated data *and* websocket ports (the 9150-collision
+fix). Consumers (impulse + walk2gether CI/test lanes) run against it.
 
 ## The problem
 

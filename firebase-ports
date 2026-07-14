@@ -24,8 +24,8 @@ independent suites, so they never collide on ports or data.
         don't collide.
   serve                  Run the daemon (auto-starts on first command).
 
-NOTE: caller-owned rework (branch registry-free-v2) — NOT yet validated end-to-end.
-firebase.json must be portless; the daemon injects ports. Ledger:
+NOTE: firebase.json ports are optional — the daemon injects (and overrides) a
+per-lease pool block, so concurrent suites never collide. Ledger:
 ~/.local/state/firebase-ports/ledger.json. See DESIGN.md.
 """
 
