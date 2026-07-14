@@ -48,7 +48,12 @@ LEDGER = STATE_DIR / "ledger.json"
 BROKER_HOST, BROKER_PORT = "127.0.0.1", 4999
 POOL_BASE, BLOCK, POOL_BLOCKS = 11000, 20, 200          # blocks of 20 ports, 11000-14999
 BLOCK_OFFSETS = {"auth": 0, "firestore": 1, "functions": 2, "storage": 3, "ui": 4,
-                 "hub": 5, "logging": 6, "pubsub": 7, "eventarc": 8, "database": 9}
+                 "hub": 5, "logging": 6, "pubsub": 7, "eventarc": 8, "database": 9,
+                 # Firestore's UI websocket is a SECOND port it needs (CLI default 9150).
+                 # It must be pool-allocated too — otherwise every concurrent firestore
+                 # emulator defaults to 9150 and they fight over it, even though their
+                 # data ports are isolated. (Block is 20 wide, so +10 is in range.)
+                 "firestore_websocket": 10}
 DEFAULT_TTL = 3600
 RECLAIM_GRACE = int(os.environ.get("FBPORTS_RECLAIM_GRACE", "45"))
 REAP_INTERVAL = int(os.environ.get("FBPORTS_REAP_INTERVAL", "10"))
@@ -136,6 +141,10 @@ def _write_injected_config(cwd, ports):
             emu[svc]["port"] = ports[svc]
             if svc == "ui":
                 emu[svc]["enabled"] = True
+            if svc == "firestore":
+                # Give firestore's UI websocket a private port too, else concurrent
+                # suites all default to 9150 and collide (isolated data port isn't enough).
+                emu[svc]["websocketPort"] = ports["firestore_websocket"]
     for svc in ("hub", "logging"):
         emu.setdefault(svc, {})["port"] = ports[svc]
     emu["singleProjectMode"] = True
