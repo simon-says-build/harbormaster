@@ -17,6 +17,11 @@ independent suites, so they never collide on ports or data.
   allocate [--owner PID] [--ttl N] [--json]
         Reserve a block WITHOUT booting — for a caller that boots its own suite (the
         agent-qa run driver). Also owner-reaped.
+  exec [--cwd DIR] [--only a,b] '<script>'
+        Run `firebase emulators:exec` on a daemon-allocated block: boots the suite on
+        free ports, runs the script (which gets FIRESTORE_EMULATOR_HOST etc.), tears
+        down. Use this instead of a bare `firebase emulators:exec` so concurrent runs
+        don't collide.
   serve                  Run the daemon (auto-starts on first command).
 
 NOTE: caller-owned rework (branch registry-free-v2) — NOT yet validated end-to-end.
@@ -47,7 +52,7 @@ BLOCK_OFFSETS = {"auth": 0, "firestore": 1, "functions": 2, "storage": 3, "ui": 
 DEFAULT_TTL = 3600
 RECLAIM_GRACE = int(os.environ.get("FBPORTS_RECLAIM_GRACE", "45"))
 REAP_INTERVAL = int(os.environ.get("FBPORTS_REAP_INTERVAL", "10"))
-READY_TIMEOUT = 180
+BOOT_BACKSTOP = 600          # only for a genuinely wedged boot; readiness is liveness-driven
 
 
 def _now():
@@ -198,18 +203,23 @@ class Broker:
             cmd += ["--project", project_id]
         with open(log, "w") as lf:
             proc = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
-        check, deadline = _service_ports(ports), time.time() + READY_TIMEOUT
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError(f"emulators exited early; see {log}\n{_tail(log)}")
+        # Wait until the ports open (success) or the suite EXITS (failure). A live
+        # emulators:start that hasn't opened its ports yet is still booting — a slow
+        # JVM on a loaded box, not stuck — so don't cap it aggressively; the backstop
+        # only guards a genuinely wedged boot.
+        check, backstop = _service_ports(ports), time.time() + BOOT_BACKSTOP
+        while True:
             if _all_open(check):
                 return proc.pid, tmp, str(log)
+            if proc.poll() is not None:
+                raise RuntimeError(f"emulators exited early; see {log}\n{_tail(log)}")
+            if time.time() > backstop:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # killpg → reap JVM children
+                except (OSError, ProcessLookupError):
+                    pass
+                raise RuntimeError(f"boot backstop ({BOOT_BACKSTOP}s) hit, process still alive; see {log}")
             time.sleep(1)
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # killpg → reap JVM children too
-        except (OSError, ProcessLookupError):
-            pass
-        raise RuntimeError(f"timed out waiting for {list(check.values())}; see {log}")
 
     def _cleanup(self, rec):
         """Coordinated teardown — killpg the whole group so JVM children die too. Never pkill."""
@@ -371,7 +381,7 @@ def cmd_serve():
 
 # ---- client --------------------------------------------------------------
 
-def _call(method, path, body=None, timeout=READY_TIMEOUT):
+def _call(method, path, body=None, timeout=BOOT_BACKSTOP + 60):   # client must outlive server's boot
     conn = http.client.HTTPConnection(BROKER_HOST, BROKER_PORT, timeout=timeout)
     data = json.dumps(body).encode() if body is not None else None
     conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
@@ -493,6 +503,37 @@ def main():
         out = _call("POST", "/allocate", {"owner_pid": pid, "owner_start": start,
                                           "ttl": int(opts.get("ttl", DEFAULT_TTL)), "label": opts.get("label")})[1]
         print(json.dumps(out) if fmt == "json" else f"{out['leaseId']}  base {out['base']}")
+    elif cmd == "exec":
+        # firebase-ports exec [--cwd DIR] [--only a,b] '<script>'
+        # Reserve a free block from the daemon, then run `firebase emulators:exec`
+        # on it (which boots the suite, sets FIRESTORE_EMULATOR_HOST etc. for the
+        # script, and tears down). This is how projects should invoke emulators:exec
+        # so concurrent runs never collide on ports.
+        _ensure()
+        cwd = _resolve_cwd(opts)
+        script = " ".join(pos)
+        if not script:
+            print("usage: firebase-ports exec [--cwd DIR] [--only a,b] '<script>'", file=sys.stderr)
+            sys.exit(1)
+        me = os.getpid()                      # this process owns the reservation for the run
+        res = ok(_call("POST", "/allocate", {"owner_pid": me, "owner_start": _proc_start(me), "label": "exec"}), "exec")
+        base, lid = res["base"], res["leaseId"]
+        tmp = _write_injected_config(cwd, _block_ports(base))
+        try:
+            run = ["firebase", "emulators:exec", "--config", tmp]
+            if only:
+                run += ["--only", ",".join(only)]
+            run.append(script)
+            rc = subprocess.call(run, cwd=cwd)
+        finally:
+            try:
+                _call("POST", "/release", {"leaseId": lid})
+            except OSError:
+                pass
+            p = Path(cwd) / tmp
+            if p.exists():
+                p.unlink()
+        sys.exit(rc)
     elif cmd in ("status", "leases"):
         if not _up():
             print("daemon not running.")
