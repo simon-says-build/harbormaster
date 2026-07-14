@@ -313,6 +313,9 @@ def _shutdown(state):
                 os.killpg(os.getpgid(int(pid)), signal.SIGKILL)
             except (OSError, ProcessLookupError):
                 pass
+    tmp = state.get("tmp_config")
+    if tmp and state.get("cwd") and (Path(state["cwd"]) / tmp).exists():
+        (Path(state["cwd"]) / tmp).unlink()
     sf = _state_file(state.get("project", ""))
     if sf.exists():
         sf.unlink()
@@ -320,15 +323,46 @@ def _shutdown(state):
 
 def _emit_ready(name, ports, state, fmt, reused):
     if fmt == "json":
-        print(json.dumps({"project": name, "reused": reused,
-                          "pid": state.get("pid"), "ports": ports}))
+        print(json.dumps({"project": name, "reused": reused, "pid": state.get("pid"),
+                          "projectId": state.get("project_id"), "ports": ports}))
     elif fmt == "env":
+        if state.get("project_id"):
+            print(f"export GCLOUD_PROJECT={state['project_id']}")
+            print(f"export GOOGLE_CLOUD_PROJECT={state['project_id']}")
         for svc, port in ports.items():
             print(f"export FIREBASE_{svc.upper()}_EMULATOR_PORT={port}")
     else:
         print(f"{name}: {'already up' if reused else 'started'} (pid {state.get('pid')})")
         for svc, port in ports.items():
             print(f"    {svc:<10} 127.0.0.1:{port}")
+
+
+# ---- config injection (registry ports → a temp config; enables portless firebase.json) ----
+INJECT_KEYS = ["auth", "firestore", "storage", "functions", "pubsub", "eventarc",
+               "database", "ui", "hub", "logging"]
+
+
+def _all_registry_ports(config):
+    """Every emulator port a project declares in the registry — injected into a
+    (portless) firebase.json so the registry is the single source of truth."""
+    return {svc: config[svc] for svc in INJECT_KEYS if svc in config}
+
+
+def _write_injected_config(cwd, base_config, ports):
+    """Copy the project's firebase config and set the emulators ports from `ports`
+    (adding hub/logging, enabling ui). Written into cwd so relative rules resolve;
+    returns its basename (git-ignore `.firebase.brokered-*.json`)."""
+    cfg = json.loads((Path(cwd) / base_config).read_text())
+    emu = cfg.setdefault("emulators", {})
+    for svc, port in ports.items():
+        entry = emu.setdefault(svc, {})
+        entry["port"] = port
+        if svc == "ui":
+            entry["enabled"] = True
+    emu["singleProjectMode"] = True
+    tmp = f".firebase.brokered-{ports.get('firestore', 'x')}.json"
+    (Path(cwd) / tmp).write_text(json.dumps(cfg, indent=2))
+    return tmp
 
 
 def cmd_up(registry, project_name=None, fresh=False, fmt="human"):
@@ -365,9 +399,10 @@ def cmd_up(registry, project_name=None, fresh=False, fmt="human"):
             print(f"{name}: no {cfg_file} in cwd — set `cwd`/`config` in the registry", file=sys.stderr)
             sys.exit(1)
 
-        cmd = ["firebase", "emulators:start"]
-        if config.get("config"):
-            cmd += ["--config", config["config"]]
+        # Inject the registry ports into a temp config so firebase.json can be
+        # portless — the registry is the single source of truth for ports.
+        tmp = _write_injected_config(cwd, cfg_file, _all_registry_ports(config))
+        cmd = ["firebase", "emulators:start", "--config", tmp]
         if config.get("only"):
             cmd += ["--only", ",".join(config["only"])]
         if config.get("project_id"):
@@ -402,8 +437,9 @@ def cmd_up(registry, project_name=None, fresh=False, fmt="human"):
             "pid": proc.pid,
             "ports": ports,
             "cwd": cwd,
+            "tmp_config": tmp,
             "only": config.get("only"),
-            "project_id": config.get("project_id"),
+            "project_id": config.get("project_id") or _firebaserc_project(cwd),
             "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "log": str(_log_file(name)),
         }
@@ -570,16 +606,7 @@ class Broker:
         raise RuntimeError("emulator port pool exhausted")
 
     def _boot(self, cwd, base_config, ports, only, project_id, label):
-        cfg = json.loads((Path(cwd) / base_config).read_text())
-        emu = cfg.setdefault("emulators", {})
-        for svc, port in ports.items():
-            entry = emu.setdefault(svc, {})
-            entry["port"] = port
-            if svc == "ui":
-                entry["enabled"] = True
-        emu["singleProjectMode"] = True
-        tmp = f".firebase.brokered-{ports['firestore']}.json"
-        (Path(cwd) / tmp).write_text(json.dumps(cfg, indent=2))
+        tmp = _write_injected_config(cwd, base_config, ports)
         log = STATE_DIR / f"lease-{label}.log"
         cmd = ["firebase", "emulators:start", "--config", tmp]
         if only:
