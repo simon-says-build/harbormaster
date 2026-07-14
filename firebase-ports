@@ -1,49 +1,38 @@
 #!/usr/bin/env python3
-"""
-firebase-ports — manage per-project Firebase emulator port allocations.
+"""firebase-ports — caller-owned Firebase emulator sandboxes.
 
-Registry: ~/.config/firebase-ports.json
+A localhost daemon hands each CALLER its own emulator sandbox (a pool port block +
+fresh data) and reclaims it when the caller's process exits. No registry, no shared
+per-project instances — two callers that both want "an impulse emulator" get two
+independent suites, so they never collide on ports or data.
 
-Commands:
-  list                 Show all project port allocations
-  apply [project]      Update firebase.json in the project directory
-  check [project]      Scan project files for hardcoded ports that don't match
+  acquire [--cwd DIR] [--owner PID] [--only a,b] [--ttl N] [--json|--env]
+        Boot a private sandbox for the project in DIR (default: nearest firebase.json
+        above $PWD). Owned by --owner (default: the calling process's parent), reaped
+        when that process exits. Prints the ports (use --env to eval into your shell).
+  up ...                 Alias for acquire (interactive dev; owner = your shell).
+  down [--cwd DIR]       Release this shell's sandbox for DIR (else it's reaped on exit).
+  release <leaseId>      Release a specific lease.
+  status                 Everything the daemon has out.
+  allocate [--owner PID] [--ttl N] [--json]
+        Reserve a block WITHOUT booting — for a caller that boots its own suite (the
+        agent-qa run driver). Also owner-reaped.
+  exec [--cwd DIR] [--only a,b] '<script>'
+        Run `firebase emulators:exec` on a daemon-allocated block: boots the suite on
+        free ports, runs the script (which gets FIRESTORE_EMULATOR_HOST etc.), tears
+        down. Use this instead of a bare `firebase emulators:exec` so concurrent runs
+        don't collide.
+  serve                  Run the daemon (auto-starts on first command).
 
-  up [project] [opts]  Ensure the project's emulators are running (idempotent):
-                       reuse if healthy, else boot and wait until ready.
-                         --fresh  restart even if up (discards emulator data)
-                         --json   print {project,ports,pid,reused} as JSON
-                         --env    print `export FIREBASE_<SVC>_EMULATOR_PORT=` lines
-  down [project]       Stop the emulators THIS tool started for the project
-  status [project]     Show which managed emulators are up (health-checked)
-
-Broker (on-demand allocation for ANY project — no pre-registered port map):
-  serve                Run the localhost daemon that assigns port BLOCKS from a
-                       pool and owns the emulator lifecycle.
-  acquire [project] [opts]  Lease + boot emulators; prints the port map.
-                         --isolated   fresh block + fresh data (concurrent runs)
-                         --cwd DIR    project dir (for arbitrary/unregistered use)
-                         --only a,b   services to start   --ttl N  isolated TTL
-                         --json | --env
-  release <leaseId>    Tear down / release a lease
-  ports <project>      Discover a shared project's current port map
-  leases               List active leases
-Shared leases are sticky (stable ports, seeded from the registry); isolated
-leases are ephemeral and TTL-reaped. Callers discover ports, never hard-code.
-
-State lives in ~/.local/state/firebase-ports/<project>.{json,log,lock}
-Optional per-project registry fields for up/down/acquire:
-  cwd         directory to launch `firebase emulators:start` in (default: path)
-  project_id  passed as --project (default: .firebaserc in cwd)
-  only        service list for --only (default: everything in firebase.json)
+NOTE: caller-owned rework (branch registry-free-v2) — NOT yet validated end-to-end.
+firebase.json must be portless; the daemon injects ports. Ledger:
+~/.local/state/firebase-ports/ledger.json. See DESIGN.md.
 """
 
-import fcntl
 import http.client
 import http.server
 import json
 import os
-import re
 import signal
 import socket
 import subprocess
@@ -54,206 +43,20 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-REGISTRY_PATH = Path.home() / ".config" / "firebase-ports.json"
-
-DEFAULT_PORTS = {
-    "firestore": 8080,
-    "auth": 9099,
-    "functions": 5001,
-    "storage": 9199,
-    "ui": 4000,
-}
-
-SCAN_EXTENSIONS = {".ts", ".tsx", ".js", ".json", ".sh"}
-SKIP_DIRS = {"node_modules", ".expo", "build", "dist", "lib", "archive", ".git", "ios", "android", ".next", ".firebase", "artifacts", "public"}
-
-# ---- emulator lifecycle (up / down / status) -----------------------------
 STATE_DIR = Path.home() / ".local" / "state" / "firebase-ports"
-# Registry keys that map to a health-checkable emulator port.
-PORT_SERVICES = ["auth", "firestore", "storage", "functions", "pubsub", "ui"]
-READY_TIMEOUT = 180  # emulators can be slow to boot (Java, rules); learned the hard way
+LEDGER = STATE_DIR / "ledger.json"
+BROKER_HOST, BROKER_PORT = "127.0.0.1", 4999
+POOL_BASE, BLOCK, POOL_BLOCKS = 11000, 20, 200          # blocks of 20 ports, 11000-14999
+BLOCK_OFFSETS = {"auth": 0, "firestore": 1, "functions": 2, "storage": 3, "ui": 4,
+                 "hub": 5, "logging": 6, "pubsub": 7, "eventarc": 8, "database": 9}
+DEFAULT_TTL = 3600
+RECLAIM_GRACE = int(os.environ.get("FBPORTS_RECLAIM_GRACE", "45"))
+REAP_INTERVAL = int(os.environ.get("FBPORTS_REAP_INTERVAL", "10"))
+BOOT_BACKSTOP = 600          # only for a genuinely wedged boot; readiness is liveness-driven
 
 
-def load_registry():
-    if not REGISTRY_PATH.exists():
-        print(f"Registry not found: {REGISTRY_PATH}", file=sys.stderr)
-        sys.exit(1)
-    return json.loads(REGISTRY_PATH.read_text())
-
-
-def find_project(registry, name=None):
-    if name and name in registry:
-        return name, registry[name]
-
-    cwd = os.getcwd()
-    for proj_name, config in registry.items():
-        proj_path = config.get("path", "")
-        if cwd.startswith(proj_path) or proj_path.startswith(cwd):
-            return proj_name, config
-
-    if name:
-        print(f"Project '{name}' not found in registry.", file=sys.stderr)
-    else:
-        print(f"Could not detect project from directory: {cwd}", file=sys.stderr)
-        print("Registered projects:", file=sys.stderr)
-        for n, c in registry.items():
-            print(f"  {n}: {c.get('path', '?')}", file=sys.stderr)
-    sys.exit(1)
-
-
-def cmd_list(registry):
-    header = f"{'Project':<15} {'Metro Dev':<11} {'Metro E2E':<11} {'Firestore':<11} {'Auth':<8} {'Functions':<11} {'Storage':<9} {'UI':<6}"
-    print(header)
-    print("-" * len(header))
-    for name, config in registry.items():
-        print(
-            f"{name:<15} "
-            f"{config.get('metro_dev', '-'):<11} "
-            f"{config.get('metro_e2e', '-'):<11} "
-            f"{config.get('firestore', '-'):<11} "
-            f"{config.get('auth', '-'):<8} "
-            f"{config.get('functions', '-'):<11} "
-            f"{config.get('storage', '-'):<9} "
-            f"{config.get('ui', '-'):<6}"
-        )
-
-
-def cmd_apply(registry, project_name=None):
-    name, config = find_project(registry, project_name)
-    proj_path = Path(config["path"])
-
-    # Find firebase.json — could be in project root or a subdirectory
-    candidates = list(proj_path.rglob("firebase.json"))
-    candidates = [c for c in candidates if "node_modules" not in str(c) and "archive" not in str(c)]
-
-    if not candidates:
-        print(f"No firebase.json found in {proj_path}", file=sys.stderr)
-        sys.exit(1)
-
-    for firebase_json_path in candidates:
-        data = json.loads(firebase_json_path.read_text())
-        if "emulators" not in data:
-            continue
-
-        emulators = data["emulators"]
-        changed = False
-
-        for service in ["auth", "firestore", "functions", "storage", "ui"]:
-            if service in config and service in emulators:
-                if isinstance(emulators[service], dict):
-                    old_port = emulators[service].get("port")
-                    new_port = config[service]
-                    if old_port != new_port:
-                        emulators[service]["port"] = new_port
-                        changed = True
-                        print(f"  {service}: {old_port} → {new_port}")
-            elif service in config and service not in emulators:
-                emulators[service] = {"port": config[service]}
-                changed = True
-                print(f"  {service}: (new) → {config[service]}")
-
-        if changed:
-            firebase_json_path.write_text(json.dumps(data, indent=2) + "\n")
-            print(f"Updated: {firebase_json_path}")
-        else:
-            print(f"Already correct: {firebase_json_path}")
-
-
-def cmd_check(registry, project_name=None):
-    name, config = find_project(registry, project_name)
-    proj_path = Path(config["path"])
-
-    # Build list of port values that belong to OTHER projects
-    own_ports = set()
-    for key in ["firestore", "auth", "functions", "storage", "ui", "metro_dev", "metro_e2e"]:
-        if key in config:
-            own_ports.add(config[key])
-
-    other_ports = {}
-    for other_name, other_config in registry.items():
-        if other_name == name:
-            continue
-        for key in ["firestore", "auth", "functions", "storage", "ui"]:
-            if key in other_config:
-                port = other_config[key]
-                other_ports[str(port)] = f"{other_name}.{key}"
-
-    # Also check for default ports if this project doesn't use defaults
-    if config.get("firestore") != DEFAULT_PORTS["firestore"]:
-        for key, port in DEFAULT_PORTS.items():
-            if str(port) not in other_ports:
-                other_ports[str(port)] = f"default.{key}"
-
-    # Scan files
-    port_pattern = re.compile(r'\b(' + '|'.join(re.escape(p) for p in other_ports.keys()) + r')\b')
-    issues = []
-
-    for filepath in proj_path.rglob("*"):
-        if filepath.is_dir():
-            continue
-        if any(skip in filepath.parts for skip in SKIP_DIRS):
-            continue
-        if filepath.suffix not in SCAN_EXTENSIONS:
-            continue
-
-        try:
-            content = filepath.read_text()
-        except (UnicodeDecodeError, PermissionError):
-            continue
-
-        for i, line in enumerate(content.splitlines(), 1):
-            if "localhost" not in line and "port" not in line.lower():
-                continue
-            for match in port_pattern.finditer(line):
-                port_str = match.group(1)
-                rel_path = filepath.relative_to(proj_path)
-                issues.append((str(rel_path), i, port_str, other_ports[port_str]))
-
-    if issues:
-        print(f"Found {len(issues)} potential port conflict(s) in {name}:\n")
-        for path, line_num, port, belongs_to in issues:
-            print(f"  {path}:{line_num}  port {port} (belongs to {belongs_to})")
-        print(f"\nExpected ports for {name}:")
-        for key in ["firestore", "auth", "functions", "storage", "ui", "metro_dev", "metro_e2e"]:
-            if key in config:
-                print(f"  {key}: {config[key]}")
-        return 1
-    else:
-        print(f"All ports in {name} look correct.")
-        return 0
-
-
-def _emulator_ports(config):
-    """Ports to health-check for readiness — the emulators that will actually
-    listen. Honours `only` (default: every configured emulator); the UI starts
-    unless disabled, independent of --only, so include it when configured."""
-    only = config.get("only")
-    svcs = set(only) if only else {s for s in PORT_SERVICES if s in config and s != "ui"}
-    if "ui" in config:
-        svcs.add("ui")
-    return {svc: config[svc] for svc in PORT_SERVICES if svc in svcs and svc in config}
-
-
-def _state_file(name):
-    return STATE_DIR / f"{name}.json"
-
-
-def _log_file(name):
-    return STATE_DIR / f"{name}.log"
-
-
-def _lock_file(name):
-    return STATE_DIR / f"{name}.lock"
-
-
-def _read_state(name):
-    p = _state_file(name)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text())
-    except (json.JSONDecodeError, OSError):
-        return None
+def _now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 def _port_open(port, host="127.0.0.1"):
@@ -267,13 +70,30 @@ def _all_open(ports):
 
 
 def _pid_alive(pid):
-    if not pid:
-        return False
     try:
         os.kill(int(pid), 0)
-    except (OSError, ProcessLookupError):
+        return True
+    except (OSError, ProcessLookupError, ValueError, TypeError):
         return False
-    return True
+
+
+def _proc_start(pid):
+    """A process's start time — pairs with the PID to survive PID reuse. '' if gone."""
+    try:
+        r = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))],
+                           capture_output=True, text=True, timeout=2)
+        return r.stdout.strip()
+    except (subprocess.SubprocessError, ValueError, TypeError):
+        return ""
+
+
+def _owner_alive(pid, start):
+    """A lease's owner is alive iff the same PID exists AND was started at the same time."""
+    if pid is None:
+        return True                       # no owner tracking → rely on TTL / liveness
+    if not _pid_alive(pid):
+        return False
+    return not start or _proc_start(pid) == start
 
 
 def _tail(path, n=25):
@@ -283,331 +103,99 @@ def _tail(path, n=25):
         return ""
 
 
-def _firebase_cwd(config):
-    """A directory containing a firebase.json to launch the emulators from."""
-    cwd = config.get("cwd", config.get("path"))
-    if cwd and (Path(cwd) / "firebase.json").exists():
-        return cwd
-    # Fall back to the shallowest firebase.json under the project path.
-    base = Path(config.get("path", cwd or "."))
-    for c in sorted(base.rglob("firebase.json"), key=lambda p: len(p.parts)):
-        if not any(skip in c.parts for skip in SKIP_DIRS):
-            return str(c.parent)
-    return cwd
-
-
-def _shutdown(state):
-    """Kill the whole process group we started, then drop the state file."""
-    pid = state.get("pid")
-    if _pid_alive(pid):
-        try:
-            os.killpg(os.getpgid(int(pid)), signal.SIGTERM)
-        except (OSError, ProcessLookupError):
-            pass
-        for _ in range(50):  # up to ~5s for a graceful stop
-            if not _pid_alive(pid):
-                break
-            time.sleep(0.1)
-        if _pid_alive(pid):
-            try:
-                os.killpg(os.getpgid(int(pid)), signal.SIGKILL)
-            except (OSError, ProcessLookupError):
-                pass
-    tmp = state.get("tmp_config")
-    if tmp and state.get("cwd") and (Path(state["cwd"]) / tmp).exists():
-        (Path(state["cwd"]) / tmp).unlink()
-    sf = _state_file(state.get("project", ""))
-    if sf.exists():
-        sf.unlink()
-
-
-def _emit_ready(name, ports, state, fmt, reused):
-    if fmt == "json":
-        print(json.dumps({"project": name, "reused": reused, "pid": state.get("pid"),
-                          "projectId": state.get("project_id"), "ports": ports}))
-    elif fmt == "env":
-        if state.get("project_id"):
-            print(f"export GCLOUD_PROJECT={state['project_id']}")
-            print(f"export GOOGLE_CLOUD_PROJECT={state['project_id']}")
-        for svc, port in ports.items():
-            print(f"export FIREBASE_{svc.upper()}_EMULATOR_PORT={port}")
-    else:
-        print(f"{name}: {'already up' if reused else 'started'} (pid {state.get('pid')})")
-        for svc, port in ports.items():
-            print(f"    {svc:<10} 127.0.0.1:{port}")
-
-
-# ---- config injection (registry ports → a temp config; enables portless firebase.json) ----
-INJECT_KEYS = ["auth", "firestore", "storage", "functions", "pubsub", "eventarc",
-               "database", "ui", "hub", "logging"]
-
-
-def _all_registry_ports(config):
-    """Every emulator port a project declares in the registry — injected into a
-    (portless) firebase.json so the registry is the single source of truth."""
-    return {svc: config[svc] for svc in INJECT_KEYS if svc in config}
-
-
-def _write_injected_config(cwd, base_config, ports):
-    """Copy the project's firebase config and set the emulators ports from `ports`
-    (adding hub/logging, enabling ui). Written into cwd so relative rules resolve;
-    returns its basename (git-ignore `.firebase.brokered-*.json`)."""
-    cfg = json.loads((Path(cwd) / base_config).read_text())
-    emu = cfg.setdefault("emulators", {})
-    for svc, port in ports.items():
-        entry = emu.setdefault(svc, {})
-        entry["port"] = port
-        if svc == "ui":
-            entry["enabled"] = True
-    emu["singleProjectMode"] = True
-    tmp = f".firebase.brokered-{ports.get('firestore', 'x')}.json"
-    (Path(cwd) / tmp).write_text(json.dumps(cfg, indent=2))
-    return tmp
-
-
-def cmd_up(registry, project_name=None, fresh=False, fmt="human"):
-    name, config = find_project(registry, project_name)
-    ports = _emulator_ports(config)
-    if not ports:
-        print(f"{name}: no emulator ports configured in the registry", file=sys.stderr)
-        sys.exit(1)
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-
-    # Serialize the boot decision so two concurrent `up` calls can't both start.
-    lock_fd = os.open(str(_lock_file(name)), os.O_CREAT | os.O_RDWR, 0o644)
-    fcntl.flock(lock_fd, fcntl.LOCK_EX)
-    try:
-        state = _read_state(name)
-        ours_up = bool(state) and _pid_alive(state.get("pid")) and _all_open(ports)
-        if ours_up and not fresh:
-            _emit_ready(name, ports, state, fmt, reused=True)
-            return
-        if ours_up and fresh:
-            _shutdown(state)
-            state = None
-
-        # Ports answering but not ours → a foreign emulator/squatter. Don't fight.
-        busy = {svc: p for svc, p in ports.items() if _port_open(p)}
-        if busy:
-            print(f"{name}: ports already in use by an unmanaged process: {busy}", file=sys.stderr)
-            print("Free them (or run `firebase-ports check`), then retry.", file=sys.stderr)
-            sys.exit(1)
-
-        cfg_file = config.get("config", "firebase.json")
-        cwd = _firebase_cwd(config)
-        if not cwd or not (Path(cwd) / cfg_file).exists():
-            print(f"{name}: no {cfg_file} in cwd — set `cwd`/`config` in the registry", file=sys.stderr)
-            sys.exit(1)
-
-        # Inject the registry ports into a temp config so firebase.json can be
-        # portless — the registry is the single source of truth for ports.
-        tmp = _write_injected_config(cwd, cfg_file, _all_registry_ports(config))
-        cmd = ["firebase", "emulators:start", "--config", tmp]
-        if config.get("only"):
-            cmd += ["--only", ",".join(config["only"])]
-        if config.get("project_id"):
-            cmd += ["--project", config["project_id"]]
-
-        if fmt == "human":
-            print(f"{name}: booting emulators in {cwd} …", file=sys.stderr)
-        with open(_log_file(name), "w") as log:
-            # start_new_session detaches into its own process group, so the
-            # emulators outlive this CLI and `down` can kill the whole group.
-            proc = subprocess.Popen(cmd, cwd=cwd, stdout=log, stderr=subprocess.STDOUT,
-                                    start_new_session=True)
-
-        deadline = time.time() + READY_TIMEOUT
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                print(f"{name}: emulators exited early (code {proc.returncode}). Last lines:",
-                      file=sys.stderr)
-                print(_tail(_log_file(name)), file=sys.stderr)
-                sys.exit(1)
-            if _all_open(ports):
-                break
-            time.sleep(1)
-        else:
-            print(f"{name}: timed out after {READY_TIMEOUT}s waiting for {list(ports.values())} "
-                  f"(see {_log_file(name)})", file=sys.stderr)
-            _shutdown({"project": name, "pid": proc.pid})
-            sys.exit(1)
-
-        state = {
-            "project": name,
-            "pid": proc.pid,
-            "ports": ports,
-            "cwd": cwd,
-            "tmp_config": tmp,
-            "only": config.get("only"),
-            "project_id": config.get("project_id") or _firebaserc_project(cwd),
-            "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-            "log": str(_log_file(name)),
-        }
-        _state_file(name).write_text(json.dumps(state, indent=2))
-        _emit_ready(name, ports, state, fmt, reused=False)
-    finally:
-        fcntl.flock(lock_fd, fcntl.LOCK_UN)
-        os.close(lock_fd)
-
-
-def cmd_down(registry, project_name=None):
-    name, _ = find_project(registry, project_name)
-    state = _read_state(name)
-    if not state:
-        print(f"{name}: not managed here (no state file)")
-        return
-    _shutdown(state)
-    print(f"{name}: stopped")
-
-
-def cmd_status(registry, project_name=None):
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    names = [find_project(registry, project_name)[0]] if project_name \
-        else sorted(p.stem for p in STATE_DIR.glob("*.json") if p.stem != "broker")
-    live = False
-    for name in names:
-        state = _read_state(name)
-        if not state:
-            continue
-        live = True
-        alive = _pid_alive(state.get("pid"))
-        ports = state.get("ports", {})
-        if alive and _all_open(ports):
-            status = "up"
-        elif alive:
-            status = "starting/unhealthy"
-        else:
-            status = "dead (stale state)"
-        print(f"{name:<15} {status:<20} pid {state.get('pid')}  since {state.get('started_at', '?')}")
-        for svc, port in ports.items():
-            print(f"    {'✓' if _port_open(port) else '✗'} {svc:<10} 127.0.0.1:{port}")
-    if not live:
-        print("No managed emulators are running.")
-
-
-def _split_args(args):
-    """Return (project_name_or_None, set_of_flag_names) from trailing argv."""
-    project, flags = None, set()
-    for a in args:
-        if a.startswith("--"):
-            flags.add(a[2:])
-        elif project is None:
-            project = a
-    return project, flags
-
-
-# ---- broker (serve / acquire / release / ports / leases) -----------------
-# `firebase-ports serve` runs a localhost HTTP daemon that assigns emulator port
-# BLOCKS on demand from a pool — so any project works with no pre-registered map —
-# and owns the emulator lifecycle. Two lease kinds:
-#   shared    one instance per project, stable ports (its assignment is remembered,
-#             seeded from the registry for known projects), reused across callers.
-#   isolated  a fresh pool block + fresh data per call (concurrent runs / e2e),
-#             TTL-reaped so a crashed caller can't leak it.
-# Callers discover ports via the acquire response or GET /ports/<project>.
-BROKER_HOST = "127.0.0.1"
-BROKER_PORT = 4999
-BROKER_STATE = STATE_DIR / "broker.json"
-POOL_BASE = 11000          # dynamic blocks live high, clear of hand-picked ports
-BLOCK = 20                 # ports per block (covers run offsets to +12, plus headroom)
-POOL_BLOCKS = 200          # 11000-14999
-DEFAULT_TTL = 3600         # isolated/reserved lease seconds; TTL is the last-resort backstop
-RECLAIM_GRACE = int(os.environ.get("FBPORTS_RECLAIM_GRACE", "45"))  # reserved: seconds down-after-active before reclaim
-REAP_INTERVAL = int(os.environ.get("FBPORTS_REAP_INTERVAL", "15"))  # reaper sweep period
-BLOCK_OFFSETS = {"firestore": 0, "auth": 1, "storage": 2, "functions": 3, "ui": 4,
-                 "hub": 5, "logging": 6, "pubsub": 7, "eventarc": 8, "database": 9}
-
-
-def _now():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
-
-
-def _block_ports(base, only):
-    wanted = set(only or ["auth", "firestore", "storage"]) | {"ui", "hub", "logging"}
-    return {svc: base + off for svc, off in BLOCK_OFFSETS.items() if svc in wanted}
-
-
-def _service_ports(ports):
-    """App-facing ports (skip the ui/hub/logging dashboards) for readiness checks."""
-    return {s: p for s, p in ports.items() if s not in ("ui", "hub", "logging")}
-
-
 def _firebaserc_project(cwd):
-    """The default project id from a dir's .firebaserc (what the emulator boots as)."""
-    if not cwd:
-        return None
     try:
         return json.loads((Path(cwd) / ".firebaserc").read_text()).get("projects", {}).get("default")
     except (OSError, json.JSONDecodeError, AttributeError):
         return None
 
 
-def _resolve_project_id(cfg, cwd=None):
-    return cfg.get("project_id") or _firebaserc_project(cwd or cfg.get("cwd") or cfg.get("path"))
+def _find_firebase_dir(start):
+    p = Path(start).resolve()
+    for d in [p, *p.parents]:
+        if (d / "firebase.json").exists():
+            return str(d)
+    return None
 
+
+def _block_ports(base):
+    return {svc: base + off for svc, off in BLOCK_OFFSETS.items()}
+
+
+def _service_ports(ports):
+    return {s: p for s, p in ports.items() if s not in ("ui", "hub", "logging")}
+
+
+def _write_injected_config(cwd, ports):
+    """Set ports on the emulators the portless firebase.json DECLARES (+ hub/logging).
+    Never adds emulators the project doesn't use. Returns the temp config basename."""
+    cfg = json.loads((Path(cwd) / "firebase.json").read_text())
+    emu = cfg.setdefault("emulators", {})
+    for svc in [k for k in emu if k != "singleProjectMode"]:
+        if svc in ports and isinstance(emu[svc], dict):
+            emu[svc]["port"] = ports[svc]
+            if svc == "ui":
+                emu[svc]["enabled"] = True
+    for svc in ("hub", "logging"):
+        emu.setdefault(svc, {})["port"] = ports[svc]
+    emu["singleProjectMode"] = True
+    tmp = f".firebase.brokered-{ports['firestore']}.json"
+    (Path(cwd) / tmp).write_text(json.dumps(cfg, indent=2))
+    return tmp
+
+
+# ---- the daemon ----------------------------------------------------------
 
 class Broker:
     def __init__(self):
         self.lock = threading.RLock()
-        self.leases = {}       # leaseId -> lease record
-        self.assignments = {}  # project -> {"ports":..., "block":..., "source":...}
+        self.leases = {}                  # leaseId -> caller-owned lease
         self._load()
-        self._seed_from_registry()
         self._reconcile()
 
     def _load(self):
-        if BROKER_STATE.exists():
+        if LEDGER.exists():
             try:
-                d = json.loads(BROKER_STATE.read_text())
-                self.leases, self.assignments = d.get("leases", {}), d.get("assignments", {})
+                self.leases = json.loads(LEDGER.read_text()).get("leases", {})
             except (json.JSONDecodeError, OSError):
                 pass
 
     def _save(self):
         STATE_DIR.mkdir(parents=True, exist_ok=True)
-        BROKER_STATE.write_text(json.dumps({"leases": self.leases, "assignments": self.assignments}, indent=2))
-
-    def _seed_from_registry(self):
-        try:
-            reg = load_registry()
-        except SystemExit:
-            return
-        for name, cfg in reg.items():
-            ports = _emulator_ports(cfg)
-            if not ports:
-                continue
-            pid = _resolve_project_id(cfg)
-            cur = self.assignments.get(name)
-            if not cur:
-                self.assignments[name] = {"ports": ports, "block": None, "source": "seed", "project_id": pid}
-            elif cur.get("source") == "seed" and not cur.get("project_id"):
-                cur["project_id"] = pid   # backfill onto pre-existing state
-        self._save()
+        LEDGER.write_text(json.dumps({"leases": self.leases}, indent=2))
 
     def _reconcile(self):
-        now = time.time()
         for lid in list(self.leases):
-            l = self.leases[lid]
-            if l["kind"] == "reserved":                       # caller-booted; TTL only
-                keep = l.get("expires") is None or l["expires"] > now
-            else:                                             # broker-booted; must be live
-                keep = _pid_alive(l.get("pid")) and _all_open(_service_ports(l["ports"]))
-            if not keep:
+            if self._dead(self.leases[lid], time.time()):
                 self._cleanup(self.leases.pop(lid))
         self._save()
 
+    def _dead(self, l, now):
+        if l.get("owner_pid") is not None and not _owner_alive(l["owner_pid"], l.get("owner_start")):
+            return True
+        exp = l.get("expires")
+        if exp is not None and exp < now:
+            return True
+        if l["kind"] == "reserved":       # caller boots its own — liveness on the block
+            base = l["block"]
+            if _port_open(base) or _port_open(base + 1):
+                l["seen_active"], l["down_since"] = True, None
+            elif l.get("seen_active"):
+                l["down_since"] = l.get("down_since") or now
+            return bool(l.get("down_since")) and now - l["down_since"] >= RECLAIM_GRACE
+        return not (_pid_alive(l.get("pid")) and _all_open(_service_ports(l["ports"])))
+
     def _free_block(self):
-        used = {l["block"] for l in self.leases.values() if l.get("block")} \
-             | {a["block"] for a in self.assignments.values() if a.get("block")}
+        used = {l["block"] for l in self.leases.values() if l.get("block")}
         for i in range(POOL_BLOCKS):
             base = POOL_BASE + i * BLOCK
             if base not in used and all(not _port_open(base + off) for off in range(BLOCK)):
                 return base
         raise RuntimeError("emulator port pool exhausted")
 
-    def _boot(self, cwd, base_config, ports, only, project_id, label):
-        tmp = _write_injected_config(cwd, base_config, ports)
-        log = STATE_DIR / f"lease-{label}.log"
+    def _boot(self, cwd, ports, only, project_id, label):
+        tmp = _write_injected_config(cwd, ports)
+        log = STATE_DIR / f"{label}.log"
         cmd = ["firebase", "emulators:start", "--config", tmp]
         if only:
             cmd += ["--only", ",".join(only)]
@@ -615,20 +203,27 @@ class Broker:
             cmd += ["--project", project_id]
         with open(log, "w") as lf:
             proc = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
-        check, deadline = _service_ports(ports), time.time() + READY_TIMEOUT
-        while time.time() < deadline:
-            if proc.poll() is not None:
-                raise RuntimeError(f"emulators exited early; see {log}\n{_tail(log)}")
+        # Wait until the ports open (success) or the suite EXITS (failure). A live
+        # emulators:start that hasn't opened its ports yet is still booting — a slow
+        # JVM on a loaded box, not stuck — so don't cap it aggressively; the backstop
+        # only guards a genuinely wedged boot.
+        check, backstop = _service_ports(ports), time.time() + BOOT_BACKSTOP
+        while True:
             if _all_open(check):
                 return proc.pid, tmp, str(log)
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except (OSError, ProcessLookupError):
-            pass
-        raise RuntimeError(f"timed out waiting for {list(check.values())}; see {log}")
+            if proc.poll() is not None:
+                raise RuntimeError(f"emulators exited early; see {log}\n{_tail(log)}")
+            if time.time() > backstop:
+                try:
+                    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)   # killpg → reap JVM children
+                except (OSError, ProcessLookupError):
+                    pass
+                raise RuntimeError(f"boot backstop ({BOOT_BACKSTOP}s) hit, process still alive; see {log}")
+            time.sleep(1)
 
-    def _cleanup(self, lease):
-        pid = lease.get("pid")
+    def _cleanup(self, rec):
+        """Coordinated teardown — killpg the whole group so JVM children die too. Never pkill."""
+        pid = rec.get("pid")
         if _pid_alive(pid):
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
@@ -641,128 +236,75 @@ class Broker:
                     time.sleep(0.1)
                 if not _pid_alive(pid):
                     break
-        tmp = lease.get("tmp_config")
-        if tmp and lease.get("cwd") and (Path(lease["cwd"]) / tmp).exists():
-            (Path(lease["cwd"]) / tmp).unlink()
+        tmp = rec.get("tmp_config")
+        if tmp and rec.get("cwd") and (Path(rec["cwd"]) / tmp).exists():
+            (Path(rec["cwd"]) / tmp).unlink()
 
-    def acquire(self, project=None, isolated=False, cwd=None, config="firebase.json",
-                only=None, project_id=None, ttl=DEFAULT_TTL):
+    def acquire(self, cwd, owner_pid, owner_start=None, only=None, ttl=DEFAULT_TTL):
         with self.lock:
-            try:
-                entry = load_registry().get(project, {}) if project else {}
-            except SystemExit:
-                entry = {}
-            cwd = cwd or entry.get("cwd") or entry.get("path")
-            config = entry.get("config", config)
-            only = only or entry.get("only")
-            # The project id the emulator boots as — consumers must use the SAME id
-            # (clients, admin SDK, clearFirestoreData): singleProjectMode maps writes
-            # across ids, but the project-scoped admin endpoints don't remap.
-            project_id = project_id or entry.get("project_id") or _firebaserc_project(cwd)
-
-            if not isolated and project:
-                lid = f"shared:{project}"
-                cur = self.leases.get(lid)
-                if cur and _pid_alive(cur.get("pid")) and _all_open(_service_ports(cur["ports"])):
-                    return {"leaseId": lid, "ports": cur["ports"], "reused": True, "projectId": cur.get("project_id")}
-                assign = self.assignments.get(project)
-                if assign:
-                    ports = dict(assign["ports"])
-                    block = assign.get("block")
-                else:
-                    block = self._free_block()
-                    ports = _block_ports(block, only)
-                    self.assignments[project] = {"ports": ports, "block": block, "source": "pool", "project_id": project_id}
-                if not cwd:
-                    raise RuntimeError(f"no cwd known for project '{project}'")
-                pid, tmp, log = self._boot(cwd, config, ports, only, project_id, project)
-                self.leases[lid] = {"leaseId": lid, "project": project, "kind": "shared", "ports": ports,
-                                    "block": block, "pid": pid, "cwd": cwd, "tmp_config": tmp, "log": log,
-                                    "project_id": project_id, "started": _now(), "expires": None}
-                self._save()
-                return {"leaseId": lid, "ports": ports, "reused": False, "projectId": project_id}
-
-            if not cwd:
-                raise RuntimeError("isolated acquire needs --cwd (or a registered project)")
-            block = self._free_block()
-            ports = _block_ports(block, only)
+            base = self._free_block()
+            ports = _block_ports(base)
             lid = f"run:{uuid.uuid4().hex[:12]}"
-            pid, tmp, log = self._boot(cwd, config, ports, only, project_id, lid.split(":")[1])
-            self.leases[lid] = {"leaseId": lid, "project": project, "kind": "isolated", "ports": ports,
-                                "block": block, "pid": pid, "cwd": cwd, "tmp_config": tmp, "log": log,
-                                "project_id": project_id, "started": _now(), "expires": time.time() + ttl}
+            project_id = _firebaserc_project(cwd)
+            pid, tmp, log = self._boot(cwd, ports, only, project_id, lid.replace(":", "-"))
+            self.leases[lid] = {"leaseId": lid, "kind": "acquired", "cwd": cwd, "block": base,
+                                "ports": ports, "pid": pid, "owner_pid": owner_pid, "owner_start": owner_start,
+                                "tmp_config": tmp, "log": log, "project_id": project_id,
+                                "started": _now(), "expires": time.time() + ttl}
             self._save()
-            return {"leaseId": lid, "ports": ports, "reused": False, "projectId": project_id}
+            return {"leaseId": lid, "ports": ports, "projectId": project_id}
 
-    def allocate(self, ttl=DEFAULT_TTL, label=None, project=None):
-        """Reserve a verified-free block WITHOUT booting — for callers that boot
-        their own suite (the run driver) but want race-free, coordinated bases.
-        Held until released or TTL expires; the verified-free check still guards
-        reuse even if a long run outlives its TTL."""
+    def allocate(self, owner_pid, owner_start=None, ttl=DEFAULT_TTL, label=None):
         with self.lock:
             base = self._free_block()
             lid = f"alloc:{uuid.uuid4().hex[:12]}"
-            self.leases[lid] = {"leaseId": lid, "project": project, "kind": "reserved",
-                                "ports": {"base": base}, "block": base, "pid": None,
-                                "cwd": None, "tmp_config": None, "log": None, "label": label,
-                                "started": _now(), "expires": time.time() + ttl}
+            self.leases[lid] = {"leaseId": lid, "kind": "reserved", "cwd": None, "block": base,
+                                "ports": {"base": base}, "pid": None, "owner_pid": owner_pid,
+                                "owner_start": owner_start, "tmp_config": None, "log": None,
+                                "label": label, "started": _now(), "expires": time.time() + ttl}
             self._save()
             return {"leaseId": lid, "base": base}
 
-    def release(self, lease_id):
+    def release(self, lid):
         with self.lock:
-            lease = self.leases.pop(lease_id, None)
-            if not lease:
+            rec = self.leases.pop(lid, None)
+            if not rec:
                 return {"released": False, "reason": "unknown lease"}
-            self._cleanup(lease)
+            self._cleanup(rec)
             self._save()
             return {"released": True}
 
-    def heartbeat(self, lease_id, ttl=DEFAULT_TTL):
+    def release_owned(self, owner_pid, cwd=None):
         with self.lock:
-            lease = self.leases.get(lease_id)
-            if lease and lease.get("expires") is not None:
-                lease["expires"] = time.time() + ttl
+            n = 0
+            for lid in list(self.leases):
+                l = self.leases[lid]
+                if l.get("owner_pid") == owner_pid and (cwd is None or l.get("cwd") == cwd):
+                    self._cleanup(self.leases.pop(lid))
+                    n += 1
+            self._save()
+            return {"released": n}
+
+    def heartbeat(self, lid, ttl=DEFAULT_TTL):
+        with self.lock:
+            l = self.leases.get(lid)
+            if l and l.get("expires") is not None:
+                l["expires"] = time.time() + ttl
                 self._save()
-            return {"ok": bool(lease)}
+            return {"ok": bool(l)}
 
-    def ports(self, project):
+    def status(self):
         with self.lock:
-            lease = self.leases.get(f"shared:{project}")
-            if lease and _pid_alive(lease.get("pid")):
-                return {"project": project, "up": True, "ports": lease["ports"], "projectId": lease.get("project_id")}
-            assign = self.assignments.get(project)
-            return {"project": project, "up": False, "ports": assign["ports"],
-                    "projectId": assign.get("project_id")} if assign else None
-
-    def leases_list(self):
-        with self.lock:
-            return [{"leaseId": l["leaseId"], "project": l.get("project"), "kind": l["kind"],
-                     "ports": l["ports"], "pid": l.get("pid"), "up": _pid_alive(l.get("pid")),
-                     "projectId": l.get("project_id"), "expires": l.get("expires")} for l in self.leases.values()]
+            return {"leases": [{"leaseId": l["leaseId"], "kind": l["kind"], "cwd": l.get("cwd"),
+                                "ownerPid": l.get("owner_pid"), "up": _pid_alive(l.get("pid")),
+                                "ports": l["ports"], "projectId": l.get("project_id"),
+                                "expires": l.get("expires")} for l in self.leases.values()]}
 
     def reap(self):
         with self.lock:
             now = time.time()
             for lid in list(self.leases):
-                lease = self.leases[lid]
-                exp = lease.get("expires")
-                expired = exp is not None and exp < now
-                if lease["kind"] == "reserved":
-                    # Liveness reclaim: a reserved block is caller-booted, so watch
-                    # the run's core ports (base+0/+1). Once they've been UP and then
-                    # stay down past a grace window, the run is gone (cleanly, killed,
-                    # crashed, or rebooted) — reclaim early instead of waiting for TTL.
-                    base = lease["block"]
-                    if _port_open(base) or _port_open(base + 1):
-                        lease["seen_active"], lease["down_since"] = True, None
-                    elif lease.get("seen_active"):
-                        lease["down_since"] = lease.get("down_since") or now
-                    reclaimed = bool(lease.get("down_since")) and now - lease["down_since"] >= RECLAIM_GRACE
-                    dead = expired or reclaimed
-                else:
-                    dead = expired or not _pid_alive(lease.get("pid"))
-                if dead:
+                if self._dead(self.leases[lid], now):
                     self._cleanup(self.leases.pop(lid))
             self._save()
 
@@ -791,31 +333,30 @@ class _Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             return self._send(200, {"ok": True})
-        if self.path == "/leases":
-            return self._send(200, {"leases": self.broker.leases_list()})
-        if self.path.startswith("/ports/"):
-            r = self.broker.ports(self.path[len("/ports/"):])
-            return self._send(200 if r else 404, r or {"error": "unknown project"})
+        if self.path == "/status":
+            return self._send(200, self.broker.status())
         self._send(404, {"error": "not found"})
 
     def do_POST(self):
-        body = self._body()
+        b, d = self.broker, self._body()
         try:
             if self.path == "/acquire":
-                keys = ("project", "isolated", "cwd", "config", "only", "project_id", "ttl")
-                return self._send(200, self.broker.acquire(**{k: body[k] for k in keys if k in body}))
+                return self._send(200, b.acquire(d["cwd"], d.get("owner_pid"), d.get("owner_start"),
+                                                 d.get("only"), d.get("ttl", DEFAULT_TTL)))
             if self.path == "/allocate":
-                return self._send(200, self.broker.allocate(ttl=body.get("ttl", DEFAULT_TTL),
-                                                            label=body.get("label"), project=body.get("project")))
+                return self._send(200, b.allocate(d.get("owner_pid"), d.get("owner_start"),
+                                                  d.get("ttl", DEFAULT_TTL), d.get("label")))
             if self.path == "/release":
-                return self._send(200, self.broker.release(body.get("leaseId")))
+                return self._send(200, b.release(d.get("leaseId")))
+            if self.path == "/release-owned":
+                return self._send(200, b.release_owned(d.get("owner_pid"), d.get("cwd")))
             if self.path == "/heartbeat":
-                return self._send(200, self.broker.heartbeat(body.get("leaseId"), body.get("ttl", DEFAULT_TTL)))
+                return self._send(200, b.heartbeat(d.get("leaseId"), d.get("ttl", DEFAULT_TTL)))
             if self.path == "/shutdown":
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return self._send(200, {"ok": True})
             self._send(404, {"error": "not found"})
-        except Exception as e:  # boot/allocation failures come back as 500
+        except Exception as e:
             self._send(500, {"error": str(e)})
 
 
@@ -833,13 +374,14 @@ def cmd_serve():
                 pass
 
     threading.Thread(target=reaper, daemon=True).start()
-    print(f"firebase-ports broker on http://{BROKER_HOST}:{BROKER_PORT} "
-          f"(pool {POOL_BASE}-{POOL_BASE + POOL_BLOCKS * BLOCK - 1}, "
-          f"{len(_Handler.broker.assignments)} projects seeded)")
+    print(f"firebase-ports daemon on http://{BROKER_HOST}:{BROKER_PORT} "
+          f"(pool {POOL_BASE}-{POOL_BASE + POOL_BLOCKS * BLOCK - 1})")
     srv.serve_forever()
 
 
-def _broker_call(method, path, body=None, timeout=READY_TIMEOUT):
+# ---- client --------------------------------------------------------------
+
+def _call(method, path, body=None, timeout=BOOT_BACKSTOP + 60):   # client must outlive server's boot
     conn = http.client.HTTPConnection(BROKER_HOST, BROKER_PORT, timeout=timeout)
     data = json.dumps(body).encode() if body is not None else None
     conn.request(method, path, body=data, headers={"Content-Type": "application/json"} if data else {})
@@ -849,46 +391,57 @@ def _broker_call(method, path, body=None, timeout=READY_TIMEOUT):
     return resp.status, out
 
 
-def _broker_up():
+def _up():
     try:
-        return _broker_call("GET", "/health", timeout=1)[0] == 200
+        return _call("GET", "/health", timeout=1)[0] == 200
     except OSError:
         return False
 
 
-def _ensure_broker():
-    if _broker_up():
+def _ensure():
+    if _up():
         return
     STATE_DIR.mkdir(parents=True, exist_ok=True)
-    log = open(STATE_DIR / "broker.log", "a")
+    log = open(STATE_DIR / "daemon.log", "a")
     subprocess.Popen([sys.argv[0], "serve"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
     for _ in range(50):
-        if _broker_up():
+        if _up():
             return
         time.sleep(0.1)
-    raise RuntimeError("broker failed to start (see ~/.local/state/firebase-ports/broker.log)")
+    raise RuntimeError("daemon failed to start (see ~/.local/state/firebase-ports/daemon.log)")
 
 
-def _print_ports(ports, fmt, lease=None, reused=None, up=None, project_id=None):
+def _owner(opts):
+    """The owning process: --owner, else the CLI's parent (the calling shell/runner)."""
+    pid = int(opts["owner"]) if opts.get("owner") else os.getppid()
+    return pid, _proc_start(pid)
+
+
+def _resolve_cwd(opts):
+    cwd = opts.get("cwd") or _find_firebase_dir(os.getcwd())
+    if not cwd or not (Path(cwd) / "firebase.json").exists():
+        print("no firebase.json here — run inside a project or pass --cwd DIR", file=sys.stderr)
+        sys.exit(1)
+    return str(Path(cwd).resolve())
+
+
+def _print(out, fmt):
+    ports, pid = out.get("ports", {}), out.get("projectId")
     if fmt == "json":
-        print(json.dumps({"leaseId": lease, "reused": reused, "projectId": project_id, "ports": ports}))
+        print(json.dumps(out))
     elif fmt == "env":
-        if project_id:   # consumers must use the SAME id the emulator booted as
-            print(f"export GCLOUD_PROJECT={project_id}")
-            print(f"export GOOGLE_CLOUD_PROJECT={project_id}")
+        if pid:
+            print(f"export GCLOUD_PROJECT={pid}")
+            print(f"export GOOGLE_CLOUD_PROJECT={pid}")
         for svc, port in ports.items():
             print(f"export FIREBASE_{svc.upper()}_EMULATOR_PORT={port}")
     else:
-        state = "reused" if reused else ("up" if up else "leased")
-        print(f"{lease or ''} {state}".strip())
-        if project_id:
-            print(f"    project    {project_id}")
+        print(f"{out.get('leaseId', '')}  ({pid})".strip())
         for svc, port in ports.items():
             print(f"    {svc:<10} 127.0.0.1:{port}")
 
 
 def _parse(args):
-    """pos list, boolean flags, and --k v / --k=v value opts."""
     pos, flags, opts = [], set(), {}
     i = 0
     while i < len(args):
@@ -897,7 +450,7 @@ def _parse(args):
             if "=" in a:
                 k, v = a[2:].split("=", 1)
                 opts[k] = v
-            elif a[2:] in ("cwd", "only", "ttl", "config") and i + 1 < len(args):
+            elif a[2:] in ("cwd", "only", "ttl", "owner", "label") and i + 1 < len(args):
                 opts[a[2:]] = args[i + 1]
                 i += 1
             else:
@@ -908,125 +461,96 @@ def _parse(args):
     return pos, flags, opts
 
 
-def cmd_acquire(project=None, isolated=False, cwd=None, only=None, fmt="human", ttl=DEFAULT_TTL):
-    _ensure_broker()
-    body = {"isolated": isolated, "ttl": ttl}
-    if project:
-        body["project"] = project
-    if cwd:
-        body["cwd"] = cwd
-    if only:
-        body["only"] = only
-    status, out = _broker_call("POST", "/acquire", body)
-    if status != 200:
-        print(f"acquire failed: {out.get('error', out)}", file=sys.stderr)
-        sys.exit(1)
-    _print_ports(out["ports"], fmt, out.get("leaseId"), out.get("reused"), project_id=out.get("projectId"))
-
-
-def cmd_release(lease_id):
-    if not lease_id or not _broker_up():
-        print("nothing to release (broker not running or no leaseId)")
-        return
-    out = _broker_call("POST", "/release", {"leaseId": lease_id})[1]
-    print("released" if out.get("released") else f"not released: {out.get('reason')}")
-
-
-def cmd_ports(project, fmt="human"):
-    if not project:
-        print("usage: firebase-ports ports <project>", file=sys.stderr)
-        sys.exit(1)
-    # Prefer the broker (live lease status), but fall back to the registry so
-    # discovery is a reliable file-read — consumers can always resolve ports/id
-    # without a running broker.
-    if _broker_up():
-        status, out = _broker_call("GET", f"/ports/{project}")
-        if status == 200:
-            _print_ports(out["ports"], fmt, up=out.get("up"), project_id=out.get("projectId"))
-            return
-    _, config = find_project(load_registry(), project)
-    ports = _emulator_ports(config)
-    if not ports:
-        print(f"no ports configured for '{project}' in the registry", file=sys.stderr)
-        sys.exit(1)
-    _print_ports(ports, fmt, up=None, project_id=_resolve_project_id(config))
-
-
-def cmd_allocate(ttl=DEFAULT_TTL, label=None, fmt="human"):
-    _ensure_broker()
-    status, out = _broker_call("POST", "/allocate", {"ttl": ttl, "label": label})
-    if status != 200:
-        print(f"allocate failed: {out.get('error', out)}", file=sys.stderr)
-        sys.exit(1)
-    print(json.dumps(out) if fmt == "json" else f"{out['leaseId']}  base {out['base']}")
-
-
-def cmd_leases():
-    if not _broker_up():
-        print("No broker running.")
-        return
-    leases = _broker_call("GET", "/leases")[1].get("leases", [])
-    if not leases:
-        print("No active leases.")
-        return
-    for l in leases:
-        exp = l.get("expires")
-        ttl = "" if exp is None else f"  ttl~{max(0, int(exp - time.time()))}s"
-        where = f"base:{l['ports']['base']}" if l["kind"] == "reserved" else f"firestore:{l['ports'].get('firestore', '?')}"
-        alive = "reserved" if l["kind"] == "reserved" else ("up" if l["up"] else "DOWN")
-        print(f"{l['leaseId']:<22} {l['kind']:<9} {alive:<8} {l.get('project') or '-':<14} {where}{ttl}")
-
-
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
         print(__doc__.strip())
         sys.exit(0)
-
     cmd = sys.argv[1]
-    registry = load_registry()
+    pos, flags, opts = _parse(sys.argv[2:])
+    fmt = "json" if "json" in flags else "env" if "env" in flags else "human"
+    only = opts["only"].split(",") if opts.get("only") else None
 
-    if cmd == "list":
-        cmd_list(registry)
-    elif cmd == "apply":
-        project = sys.argv[2] if len(sys.argv) > 2 else None
-        cmd_apply(registry, project)
-    elif cmd == "check":
-        project = sys.argv[2] if len(sys.argv) > 2 else None
-        sys.exit(cmd_check(registry, project))
-    elif cmd == "up":
-        project, flags = _split_args(sys.argv[2:])
-        fmt = "json" if "json" in flags else "env" if "env" in flags else "human"
-        cmd_up(registry, project, fresh="fresh" in flags, fmt=fmt)
-    elif cmd == "down":
-        project, _ = _split_args(sys.argv[2:])
-        cmd_down(registry, project)
-    elif cmd == "status":
-        project, _ = _split_args(sys.argv[2:])
-        cmd_status(registry, project)
-    elif cmd == "serve":
+    def ok(res, verb):
+        st, out = res
+        if st != 200:
+            print(f"{verb} failed: {out.get('error', out)}", file=sys.stderr)
+            sys.exit(1)
+        return out
+
+    if cmd == "serve":
         cmd_serve()
-    elif cmd == "acquire":
-        pos, flags, opts = _parse(sys.argv[2:])
-        fmt = "json" if "json" in flags else "env" if "env" in flags else "human"
-        cmd_acquire(project=pos[0] if pos else None, isolated="isolated" in flags,
-                    cwd=opts.get("cwd"), only=opts["only"].split(",") if opts.get("only") else None,
-                    fmt=fmt, ttl=int(opts.get("ttl", DEFAULT_TTL)))
-    elif cmd == "allocate":
-        pos, flags, opts = _parse(sys.argv[2:])
-        cmd_allocate(ttl=int(opts.get("ttl", DEFAULT_TTL)), label=opts.get("label"),
-                     fmt="json" if "json" in flags else "human")
+    elif cmd in ("acquire", "up"):
+        _ensure()
+        pid, start = _owner(opts)
+        _print(ok(_call("POST", "/acquire", {"cwd": _resolve_cwd(opts), "owner_pid": pid,
+                                             "owner_start": start, "only": only,
+                                             "ttl": int(opts.get("ttl", DEFAULT_TTL))}), "acquire"), fmt)
+    elif cmd == "down":
+        if _up():
+            out = _call("POST", "/release-owned", {"owner_pid": os.getppid(), "cwd": _resolve_cwd(opts)})[1]
+            print(f"released {out.get('released', 0)} sandbox(es)")
+        else:
+            print("daemon not running")
     elif cmd == "release":
-        pos, _, _ = _parse(sys.argv[2:])
-        cmd_release(pos[0] if pos else None)
-    elif cmd == "ports":
-        pos, flags, _ = _parse(sys.argv[2:])
-        fmt = "json" if "json" in flags else "env" if "env" in flags else "human"
-        cmd_ports(pos[0] if pos else None, fmt)
-    elif cmd == "leases":
-        cmd_leases()
+        if _up() and pos:
+            out = _call("POST", "/release", {"leaseId": pos[0]})[1]
+            print("released" if out.get("released") else f"not released: {out.get('reason')}")
+        else:
+            print("nothing to release")
+    elif cmd == "allocate":
+        _ensure()
+        pid, start = _owner(opts)
+        out = _call("POST", "/allocate", {"owner_pid": pid, "owner_start": start,
+                                          "ttl": int(opts.get("ttl", DEFAULT_TTL)), "label": opts.get("label")})[1]
+        print(json.dumps(out) if fmt == "json" else f"{out['leaseId']}  base {out['base']}")
+    elif cmd == "exec":
+        # firebase-ports exec [--cwd DIR] [--only a,b] '<script>'
+        # Reserve a free block from the daemon, then run `firebase emulators:exec`
+        # on it (which boots the suite, sets FIRESTORE_EMULATOR_HOST etc. for the
+        # script, and tears down). This is how projects should invoke emulators:exec
+        # so concurrent runs never collide on ports.
+        _ensure()
+        cwd = _resolve_cwd(opts)
+        script = " ".join(pos)
+        if not script:
+            print("usage: firebase-ports exec [--cwd DIR] [--only a,b] '<script>'", file=sys.stderr)
+            sys.exit(1)
+        me = os.getpid()                      # this process owns the reservation for the run
+        res = ok(_call("POST", "/allocate", {"owner_pid": me, "owner_start": _proc_start(me), "label": "exec"}), "exec")
+        base, lid = res["base"], res["leaseId"]
+        tmp = _write_injected_config(cwd, _block_ports(base))
+        try:
+            run = ["firebase", "emulators:exec", "--config", tmp]
+            if only:
+                run += ["--only", ",".join(only)]
+            run.append(script)
+            rc = subprocess.call(run, cwd=cwd)
+        finally:
+            try:
+                _call("POST", "/release", {"leaseId": lid})
+            except OSError:
+                pass
+            p = Path(cwd) / tmp
+            if p.exists():
+                p.unlink()
+        sys.exit(rc)
+    elif cmd in ("status", "leases"):
+        if not _up():
+            print("daemon not running.")
+            return
+        leases = _call("GET", "/status")[1].get("leases", [])
+        if not leases:
+            print("nothing out.")
+            return
+        for l in leases:
+            exp = l.get("expires")
+            ttl = "" if exp is None else f"  ttl~{max(0, int(exp - time.time()))}s"
+            where = f"base:{l['ports']['base']}" if l["kind"] == "reserved" else f"firestore:{l['ports'].get('firestore')}"
+            print(f"{l['leaseId']:<22} {l['kind']:<9} owner:{str(l.get('ownerPid') or '-'):<7} "
+                  f"{'up' if l['up'] else '-':<3} {where}{ttl}  {l.get('cwd') or ''}")
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
-        print("Commands: list, apply, check, up, down, status, serve, acquire, release, ports, leases", file=sys.stderr)
+        print("Commands: acquire, up, down, release, allocate, status, leases, serve", file=sys.stderr)
         sys.exit(1)
 
 
