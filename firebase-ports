@@ -183,7 +183,7 @@ class Broker:
             elif l.get("seen_active"):
                 l["down_since"] = l.get("down_since") or now
             return bool(l.get("down_since")) and now - l["down_since"] >= RECLAIM_GRACE
-        return not (_pid_alive(l.get("pid")) and _all_open(_service_ports(l["ports"])))
+        return not (_pid_alive(l.get("pid")) and _all_open(l.get("check_ports") or _service_ports(l["ports"])))
 
     def _free_block(self):
         used = {l["block"] for l in self.leases.values() if l.get("block")}
@@ -193,8 +193,15 @@ class Broker:
                 return base
         raise RuntimeError("emulator port pool exhausted")
 
-    def _boot(self, cwd, ports, only, project_id, label):
-        tmp = _write_injected_config(cwd, ports)
+    def _boot(self, cwd, block, only, project_id, label):
+        all_ports = _block_ports(block)
+        tmp = _write_injected_config(cwd, all_ports)
+        # Readiness/liveness track ONLY the data services actually started (respect
+        # --only, else the project's declared emulators; skip ui/hub/logging) — else
+        # we'd wait forever for ports (functions, pubsub, …) that never open.
+        declared = [k for k in json.loads((Path(cwd) / "firebase.json").read_text()).get("emulators", {}) if k != "singleProjectMode"]
+        run_ports = {s: all_ports[s] for s in (only or declared) if s in all_ports}
+        check = {s: p for s, p in run_ports.items() if s not in ("ui", "hub", "logging")}
         log = STATE_DIR / f"{label}.log"
         cmd = ["firebase", "emulators:start", "--config", tmp]
         if only:
@@ -203,14 +210,13 @@ class Broker:
             cmd += ["--project", project_id]
         with open(log, "w") as lf:
             proc = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
-        # Wait until the ports open (success) or the suite EXITS (failure). A live
-        # emulators:start that hasn't opened its ports yet is still booting — a slow
-        # JVM on a loaded box, not stuck — so don't cap it aggressively; the backstop
-        # only guards a genuinely wedged boot.
-        check, backstop = _service_ports(ports), time.time() + BOOT_BACKSTOP
+        # Liveness-driven: keep waiting while the process is alive (a slow JVM is still
+        # booting, not stuck); succeed when the ports open; fail if it exits; the
+        # backstop only guards a genuinely wedged boot.
+        backstop = time.time() + BOOT_BACKSTOP
         while True:
             if _all_open(check):
-                return proc.pid, tmp, str(log)
+                return proc.pid, tmp, str(log), run_ports, check
             if proc.poll() is not None:
                 raise RuntimeError(f"emulators exited early; see {log}\n{_tail(log)}")
             if time.time() > backstop:
@@ -243,12 +249,12 @@ class Broker:
     def acquire(self, cwd, owner_pid, owner_start=None, only=None, ttl=DEFAULT_TTL):
         with self.lock:
             base = self._free_block()
-            ports = _block_ports(base)
             lid = f"run:{uuid.uuid4().hex[:12]}"
             project_id = _firebaserc_project(cwd)
-            pid, tmp, log = self._boot(cwd, ports, only, project_id, lid.replace(":", "-"))
+            pid, tmp, log, ports, check = self._boot(cwd, base, only, project_id, lid.replace(":", "-"))
             self.leases[lid] = {"leaseId": lid, "kind": "acquired", "cwd": cwd, "block": base,
-                                "ports": ports, "pid": pid, "owner_pid": owner_pid, "owner_start": owner_start,
+                                "ports": ports, "check_ports": check, "pid": pid,
+                                "owner_pid": owner_pid, "owner_start": owner_start,
                                 "tmp_config": tmp, "log": log, "project_id": project_id,
                                 "started": _now(), "expires": time.time() + ttl}
             self._save()
@@ -430,11 +436,18 @@ def _print(out, fmt):
     if fmt == "json":
         print(json.dumps(out))
     elif fmt == "env":
+        # Standard Firebase host vars (admin SDK + emulators:exec auto-read these) AND
+        # EMULATOR_<SVC>_PORT (what app.config / config.sh / scrub scripts read).
+        std = {"firestore": "FIRESTORE_EMULATOR_HOST", "auth": "FIREBASE_AUTH_EMULATOR_HOST",
+               "storage": "FIREBASE_STORAGE_EMULATOR_HOST", "database": "FIREBASE_DATABASE_EMULATOR_HOST",
+               "pubsub": "PUBSUB_EMULATOR_HOST"}
         if pid:
             print(f"export GCLOUD_PROJECT={pid}")
             print(f"export GOOGLE_CLOUD_PROJECT={pid}")
         for svc, port in ports.items():
-            print(f"export FIREBASE_{svc.upper()}_EMULATOR_PORT={port}")
+            if svc in std:
+                print(f"export {std[svc]}=127.0.0.1:{port}")
+            print(f"export EMULATOR_{svc.upper()}_PORT={port}")
     else:
         print(f"{out.get('leaseId', '')}  ({pid})".strip())
         for svc, port in ports.items():
