@@ -1,0 +1,36 @@
+{
+  "name": "firebase-ports",
+  "version": "0.1.0",
+  "description": "A localhost daemon that hands each caller its own isolated Firebase emulator sandbox — pool-assigned ports, fresh data, reaped when the caller exits. No port collisions, no shared instances, no pkill.",
+  "bin": {
+    "firebase-ports": "firebase-ports"
+  },
+  "files": [
+    "firebase-ports",
+    "DESIGN.md",
+    "firebase-ports.example.json"
+  ],
+  "keywords": [
+    "firebase",
+    "firebase-emulator",
+    "emulators",
+    "ports",
+    "testing",
+    "ci",
+    "detox"
+  ],
+  "author": "Michael Dawson",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/michaeldawson/firebase-ports.git"
+  },
+  "homepage": "https://github.com/michaeldawson/firebase-ports#readme",
+  "bugs": {
+    "url": "https://github.com/michaeldawson/firebase-ports/issues"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ]
+}

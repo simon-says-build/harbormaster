@@ -1,103 +1,79 @@
 # firebase-ports
 
-Coordinate Firebase emulator ports across many projects on one machine — a small
-registry + an idempotent `up`/`down`/`status` CLI + an on-demand broker that hands
-out port **blocks** from a pool and owns the emulator lifecycle.
+A localhost daemon that hands each **caller** its own isolated Firebase emulator
+sandbox — a pool-assigned port block plus fresh data — and reclaims it when the
+caller's process exits.
 
-If you run several Firebase projects locally (dev, tests, CI, agents) you've hit
-this: emulators fight over ports, `firebase emulators:start` collides with another
-one already up, and a stray `pkill -f emulators:start` nukes *everyone's*. This tool
-makes emulator startup **coordinated and idempotent** so that stops happening.
+If you run several Firebase projects locally (dev, tests, CI, agents) you know the
+pain: emulators fight over ports, a bare `firebase emulators:start` collides with
+another suite, and `pkill` "fixes" it by nuking *everyone's* emulators. firebase-ports
+removes the collision entirely — two callers that both want "an impulse emulator" get
+two independent suites (own ports, own data), so they never step on each other.
+
+```
+$ eval "$(firebase-ports acquire --cwd ./my-app --only auth,firestore --env)"
+$ echo $FIRESTORE_EMULATOR_HOST
+127.0.0.1:11001
+# ...run your tests against the suite...
+# it's torn down automatically when this shell exits
+```
+
+## Requirements
+
+- **Python 3.8+** — the daemon is a single Python script (`#!/usr/bin/env python3`).
+  npm just ships and links the executable; it must be able to find `python3` on PATH.
+- **firebase-tools** (`firebase`) on PATH — it boots the actual emulators.
+- macOS or Linux.
 
 ## Install
 
-It's a single Python 3 script (stdlib only) — put it on your `PATH`:
-
 ```bash
-curl -o ~/.local/bin/firebase-ports https://raw.githubusercontent.com/<you>/firebase-ports/main/firebase-ports
-chmod +x ~/.local/bin/firebase-ports
+npm install -g firebase-ports        # global CLI
+# or add it to a project so it ships with your app/agent:
+npm install firebase-ports           # → node_modules/.bin/firebase-ports
 ```
 
-Requires `python3` and the `firebase` CLI.
+## Usage
 
-## The registry
-
-`~/.config/firebase-ports.json` maps each project to a fixed port allocation. See
-[`firebase-ports.example.json`](firebase-ports.example.json). Per-project fields:
-
-| field | meaning |
-|---|---|
-| `path` | project root (used to auto-detect the project from your cwd) |
-| `firestore`/`auth`/`storage`/`functions`/`pubsub`/`ui` | the emulator ports |
-| `cwd` | dir to launch `firebase emulators:start` in (default: `path`) — the one with `firebase.json` |
-| `project_id` | passed as `--project` (default: read from `.firebaserc`) |
-| `only` | services for `--only` (default: everything in `firebase.json`) |
-| `config` | alternate config file, e.g. `firebase.e2e.json`, for an isolated second instance |
-
-Tip: pin each project's emulator `hub`/`logging` ports (in its `firebase.json`) to a
-private lane, so multiple projects' suites can run at once without colliding on the
-default 4400/4500.
-
-## Commands
-
-### Direct lifecycle (simple, per-project)
+The daemon auto-starts on the first command. `firebase.json` ports are **optional** —
+the daemon injects (and overrides) a pool block into a temp config per lease, so you
+never hand-assign a port.
 
 ```bash
-firebase-ports up [project] [--fresh|--json|--env]   # ensure up: reuse if healthy, else boot + wait until ready
-firebase-ports down [project]                          # stop what THIS tool started (never touches others)
-firebase-ports status [project]                        # health-checked view of what's up
+# Boot a private suite for the project in DIR, owned by the calling shell,
+# reaped when it exits. --env prints exports to eval into your shell:
+eval "$(firebase-ports acquire --cwd ./my-app --only auth,firestore,functions --env)"
+#   → FIRESTORE_EMULATOR_HOST, FIREBASE_AUTH_EMULATOR_HOST, EMULATOR_<SVC>_PORT,
+#     GCLOUD_PROJECT (from .firebaserc)
+
+# Run a command inside a fresh suite that tears down after (great for CI):
+firebase-ports exec --cwd ./my-app --only auth,firestore "npm test"
+
+# Reserve a block WITHOUT booting — for a caller that starts its own suite:
+firebase-ports allocate --json          # → { "leaseId": "...", "base": 11000 }
+
+firebase-ports status                    # everything the daemon has out
+firebase-ports down --cwd ./my-app       # release this shell's lease early
 ```
 
-`up` is idempotent and safe to run before every test run. It refuses to boot if the
-ports are held by an *unmanaged* process (rather than double-booting). `--env` prints
-`export FIREBASE_<SVC>_EMULATOR_PORT=` (and `GCLOUD_PROJECT`) lines for `eval`.
+`--json` on `acquire`/`allocate` returns the ports/base as JSON for scripting.
 
-### Registry maintenance
+## How it works
 
-```bash
-firebase-ports list             # all allocations
-firebase-ports apply [project]  # write the ports into the project's firebase.json
-firebase-ports check [project]  # scan for hard-coded ports that don't match the registry
-```
+- **Caller-owned.** One primitive: `acquire {cwd, owner_pid} → {ports, projectId}`.
+  Issuance is unique per *caller*, not per project — so concurrent callers of the
+  same project get independent suites.
+- **Reaped on exit.** The daemon kills the suite (the whole process group, so the JVM
+  children die too) when `owner_pid` dies. The caller's death *is* the release —
+  nothing to remember, and never a reason to `pkill`. A TTL and emulator-liveness are
+  backstops.
+- **Pool ports.** Blocks of 20 from 11000–14999; each firestore suite also gets a
+  private websocket port, so concurrent suites never collide on the default 9150.
+- **No registry, no shared instances.** A "project" is just the `firebase.json` in
+  `cwd`; the project id comes from `.firebaserc`.
 
-### Broker — on-demand allocation for *any* project
-
-For concurrency (parallel test runs, CI, agents) a fixed per-project port doesn't
-work — you might run the same project's suite several times at once, each needing its
-own isolated data. The broker allocates **port blocks from a pool** on demand and owns
-their lifecycle.
-
-```bash
-firebase-ports serve            # the localhost:4999 daemon (auto-starts on first acquire)
-
-firebase-ports acquire [project]                       # SHARED lease: stable ports (seeded from the registry), reused
-firebase-ports acquire --isolated --cwd DIR --only …   # ISOLATED lease: a fresh block + fresh data, TTL-reaped
-firebase-ports release <leaseId>                       # tear down / release
-firebase-ports ports <project>                         # discover a shared project's ports + project id
-firebase-ports leases                                  # active leases
-firebase-ports allocate [--ttl N]                      # reserve a free block WITHOUT booting (for callers that boot their own suite)
-```
-
-- **Shared** leases are sticky — a project keeps stable, discoverable ports (great for
-  dev; new projects auto-get a free block on first use, remembered thereafter).
-- **Isolated** leases are ephemeral — a fresh block + clean data per call, reclaimed by
-  TTL *and* by liveness (once the run's ports have been up and then stay down, the block
-  is returned automatically — crash/kill/reboot-safe).
-- **`allocate`** is reserve-only: coordinated, verified-free block reservation for a
-  caller (e.g. a CI/agent runner) that generates its own emulator config and boots it.
-- Consumers **discover** ports and the project id (`acquire` response / `ports`) instead
-  of hard-coding them.
-
-## Gotcha: `singleProjectMode` + project ids
-
-With `singleProjectMode`, the Firestore emulator funnels **writes** from any project id
-into one datastore — but project-scoped admin endpoints (`clearFirestoreData`,
-import/export, rules) still key off the id in the request. So a client using a different
-project id than the emulator booted as will *write fine but fail to clear* (silent
-no-op). Keep the id consistent: the emulator's `--project`, every client's `projectId`,
-and any `clearFirestoreData({projectId})` must match. `firebase-ports ports <project>`
-tells you the id the emulator actually booted as.
+See [DESIGN.md](./DESIGN.md) for the full architecture.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT — see [LICENSE](./LICENSE).
