@@ -19,9 +19,13 @@ independent suites, so they never collide on ports or data.
   down [--cwd DIR]       Release this shell's sandbox for DIR (else it's reaped on exit).
   release <leaseId>      Release a specific lease.
   status                 Everything the daemon has out.
-  allocate [--owner PID] [--ttl N] [--json]
+  allocate [--owner PID] [--ttl N] [--metro] [--sim] [--json|--env]
         Reserve a block WITHOUT booting — for a caller that boots its own suite (the
-        agent-qa run driver). Also owner-reaped.
+        agent-qa run driver). Also owner-reaped. --metro/--sim work as on acquire
+        (metro port in the block; private simulator, deleted on reap) for e2e Metro
+        sessions whose emulators are per-RUN acquires. NOTE: reserved leases also
+        reap on TTL even with a live owner — pass a long --ttl for long-lived
+        Metro sessions (owner death still reaps promptly).
   exec [--cwd DIR] [--only a,b] '<script>'
         Run `firebase emulators:exec` on a daemon-allocated block: boots the suite on
         free ports, runs the script (which gets FIRESTORE_EMULATOR_HOST etc.), tears
@@ -324,16 +328,34 @@ class Broker:
                 resp["sim"] = {"udid": sim_udid, "name": sim_name}
             return resp
 
-    def allocate(self, owner_pid, owner_start=None, ttl=DEFAULT_TTL, label=None):
+    def allocate(self, owner_pid, owner_start=None, ttl=DEFAULT_TTL, label=None,
+                 metro=False, sim=False, sim_device=None, sim_runtime=None):
         with self.lock:
             base = self._free_block()
             lid = f"alloc:{uuid.uuid4().hex[:12]}"
+            ports = {"base": base}
+            # A reserved block can also carry the dev-env extras for callers that
+            # boot their own emulators (or none at all): a Metro port and/or a
+            # private simulator. Used by e2e Metro sessions whose emulator suites
+            # are per-RUN acquires (walk2gether) — the long-lived Metro process
+            # owns just the port + sim.
+            if metro or sim:
+                ports["metro"] = base + METRO_OFFSET
+            sim_udid = sim_name = None
+            if sim:
+                sim_name = lid.replace(":", "-")
+                sim_udid = _sim_create_boot(sim_device or DEFAULT_SIM_DEVICE,
+                                            sim_runtime or DEFAULT_SIM_RUNTIME, sim_name)
             self.leases[lid] = {"leaseId": lid, "kind": "reserved", "cwd": None, "block": base,
-                                "ports": {"base": base}, "pid": None, "owner_pid": owner_pid,
+                                "ports": ports, "pid": None, "owner_pid": owner_pid,
                                 "owner_start": owner_start, "tmp_config": None, "log": None,
-                                "label": label, "started": _now(), "expires": time.time() + ttl}
+                                "label": label, "sim_udid": sim_udid, "sim_name": sim_name,
+                                "started": _now(), "expires": time.time() + ttl}
             self._save()
-            return {"leaseId": lid, "base": base}
+            resp = {"leaseId": lid, "base": base, "ports": ports}
+            if sim_udid:
+                resp["sim"] = {"udid": sim_udid, "name": sim_name}
+            return resp
 
     def release(self, lid):
         with self.lock:
@@ -418,7 +440,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                                                  d.get("sim_device"), d.get("sim_runtime")))
             if self.path == "/allocate":
                 return self._send(200, b.allocate(d.get("owner_pid"), d.get("owner_start"),
-                                                  d.get("ttl", DEFAULT_TTL), d.get("label")))
+                                                  d.get("ttl", DEFAULT_TTL), d.get("label"),
+                                                  d.get("metro", False), d.get("sim", False),
+                                                  d.get("sim_device"), d.get("sim_runtime")))
             if self.path == "/release":
                 return self._send(200, b.release(d.get("leaseId")))
             if self.path == "/release-owned":
@@ -592,9 +616,27 @@ def main():
     elif cmd == "allocate":
         _ensure()
         pid, start = _owner(opts)
-        out = _call("POST", "/allocate", {"owner_pid": pid, "owner_start": start,
-                                          "ttl": int(opts.get("ttl", DEFAULT_TTL)), "label": opts.get("label")})[1]
-        print(json.dumps(out) if fmt == "json" else f"{out['leaseId']}  base {out['base']}")
+        out = ok(_call("POST", "/allocate", {"owner_pid": pid, "owner_start": start,
+                                             "ttl": int(opts.get("ttl", DEFAULT_TTL)),
+                                             "label": opts.get("label"),
+                                             "metro": "metro" in flags, "sim": "sim" in flags,
+                                             "sim_device": opts.get("sim-device"),
+                                             "sim_runtime": opts.get("sim-runtime")}), "allocate")
+        if fmt == "env":
+            # Reserved block, nothing booted — emit only the dev-env extras (plus
+            # the base for callers that derive their own ports from it).
+            print(f"export FBPORTS_BLOCK_BASE={out['base']}")
+            if out.get("ports", {}).get("metro"):
+                print(f"export METRO_PORT={out['ports']['metro']}")
+            if out.get("sim"):
+                print(f"export DETOX_UDID={out['sim']['udid']}")
+                print(f"export DETOX_SIM_NAME={out['sim']['name']}")
+        elif fmt == "json":
+            print(json.dumps(out))
+        else:
+            extra = f"  metro {out['ports']['metro']}" if out.get("ports", {}).get("metro") else ""
+            extra += f"  sim {out['sim']['udid']}" if out.get("sim") else ""
+            print(f"{out['leaseId']}  base {out['base']}{extra}")
     elif cmd == "exec":
         # firebase-ports exec [--cwd DIR] [--only a,b] '<script>'
         # Reserve a free block from the daemon, then run `firebase emulators:exec`
