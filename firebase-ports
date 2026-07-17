@@ -6,10 +6,15 @@ fresh data) and reclaims it when the caller's process exits. No registry, no sha
 per-project instances — two callers that both want "an impulse emulator" get two
 independent suites, so they never collide on ports or data.
 
-  acquire [--cwd DIR] [--owner PID] [--only a,b] [--ttl N] [--json|--env]
+  acquire [--cwd DIR] [--owner PID] [--only a,b] [--ttl N] [--metro] [--sim] [--json|--env]
         Boot a private sandbox for the project in DIR (default: nearest firebase.json
         above $PWD). Owned by --owner (default: the calling process's parent), reaped
         when that process exits. Prints the ports (use --env to eval into your shell).
+        --metro also reserves a Metro/Expo port (METRO_PORT). --sim also creates+boots
+        a private iOS simulator (DETOX_UDID/DETOX_SIM_NAME) and implies --metro; the
+        sim is deleted when the lease is reaped. Tune with --sim-device / --sim-runtime
+        (or FBPORTS_SIM_DEVICE / FBPORTS_SIM_RUNTIME). This is the e2e dev-env: one
+        lease = emulators + metro port + simulator, all torn down when the owner exits.
   up ...                 Alias for acquire (interactive dev; owner = your shell).
   down [--cwd DIR]       Release this shell's sandbox for DIR (else it's reaped on exit).
   release <leaseId>      Release a specific lease.
@@ -54,6 +59,10 @@ BLOCK_OFFSETS = {"auth": 0, "firestore": 1, "functions": 2, "storage": 3, "ui": 
                  # emulator defaults to 9150 and they fight over it, even though their
                  # data ports are isolated. (Block is 20 wide, so +10 is in range.)
                  "firestore_websocket": 10}
+METRO_OFFSET = 11        # Metro/Expo dev-server port in the block (offsets 0-10 are emulators)
+DEFAULT_SIM_DEVICE = os.environ.get("FBPORTS_SIM_DEVICE", "iPhone 16")
+DEFAULT_SIM_RUNTIME = os.environ.get("FBPORTS_SIM_RUNTIME",
+                                     "com.apple.CoreSimulator.SimRuntime.iOS-18-2")
 DEFAULT_TTL = 3600
 RECLAIM_GRACE = int(os.environ.get("FBPORTS_RECLAIM_GRACE", "45"))
 REAP_INTERVAL = int(os.environ.get("FBPORTS_REAP_INTERVAL", "10"))
@@ -151,6 +160,30 @@ def _write_injected_config(cwd, ports):
     tmp = f".firebase.brokered-{ports['firestore']}.json"
     (Path(cwd) / tmp).write_text(json.dumps(cfg, indent=2))
     return tmp
+
+
+def _sim_create_boot(device, runtime, name):
+    """Create a fresh iOS simulator, boot it, and return its UDID. The device is
+    per-lease (unique name) so concurrent e2e runs never share one; reaped on
+    lease teardown. Boots on a PINNED runtime so we don't pay a second OS image."""
+    r = subprocess.run(["xcrun", "simctl", "create", name, device, runtime],
+                       capture_output=True, text=True, timeout=120)
+    if r.returncode != 0:
+        raise RuntimeError(f"simctl create failed ({device} / {runtime}): {r.stderr.strip()}")
+    udid = r.stdout.strip()
+    # boot is idempotent-ish (errors if already booted); bootstatus waits until ready.
+    subprocess.run(["xcrun", "simctl", "boot", udid], capture_output=True, text=True, timeout=120)
+    subprocess.run(["xcrun", "simctl", "bootstatus", udid, "-b"], capture_output=True, text=True, timeout=300)
+    return udid
+
+
+def _sim_teardown(udid):
+    """Shut down + delete a leased simulator (best effort) so devices never leak."""
+    for args in (["shutdown", udid], ["delete", udid]):
+        try:
+            subprocess.run(["xcrun", "simctl", *args], capture_output=True, text=True, timeout=60)
+        except (subprocess.SubprocessError, OSError):
+            pass
 
 
 # ---- the daemon ----------------------------------------------------------
@@ -254,20 +287,42 @@ class Broker:
         tmp = rec.get("tmp_config")
         if tmp and rec.get("cwd") and (Path(rec["cwd"]) / tmp).exists():
             (Path(rec["cwd"]) / tmp).unlink()
+        if rec.get("sim_udid"):
+            _sim_teardown(rec["sim_udid"])
 
-    def acquire(self, cwd, owner_pid, owner_start=None, only=None, ttl=DEFAULT_TTL):
+    def acquire(self, cwd, owner_pid, owner_start=None, only=None, ttl=DEFAULT_TTL,
+                metro=False, sim=False, sim_device=None, sim_runtime=None):
         with self.lock:
             base = self._free_block()
             lid = f"run:{uuid.uuid4().hex[:12]}"
             project_id = _firebaserc_project(cwd)
             pid, tmp, log, ports, check = self._boot(cwd, base, only, project_id, lid.replace(":", "-"))
+            # A leased simulator implies a metro port (the e2e dev-env wants both).
+            # The metro port lives in the lease's own 20-port block, so it's
+            # collision-free by construction and needs no health check.
+            if metro or sim:
+                ports["metro"] = base + METRO_OFFSET
+            sim_udid = sim_name = None
+            if sim:
+                sim_name = lid.replace(":", "-")
+                try:
+                    sim_udid = _sim_create_boot(sim_device or DEFAULT_SIM_DEVICE,
+                                                sim_runtime or DEFAULT_SIM_RUNTIME, sim_name)
+                except Exception:
+                    # Don't leak the emulators we just booted if the sim fails.
+                    self._cleanup({"pid": pid, "cwd": cwd, "tmp_config": tmp})
+                    raise
             self.leases[lid] = {"leaseId": lid, "kind": "acquired", "cwd": cwd, "block": base,
                                 "ports": ports, "check_ports": check, "pid": pid,
                                 "owner_pid": owner_pid, "owner_start": owner_start,
                                 "tmp_config": tmp, "log": log, "project_id": project_id,
+                                "sim_udid": sim_udid, "sim_name": sim_name,
                                 "started": _now(), "expires": time.time() + ttl}
             self._save()
-            return {"leaseId": lid, "ports": ports, "projectId": project_id}
+            resp = {"leaseId": lid, "ports": ports, "projectId": project_id}
+            if sim_udid:
+                resp["sim"] = {"udid": sim_udid, "name": sim_name}
+            return resp
 
     def allocate(self, owner_pid, owner_start=None, ttl=DEFAULT_TTL, label=None):
         with self.lock:
@@ -313,7 +368,8 @@ class Broker:
             return {"leases": [{"leaseId": l["leaseId"], "kind": l["kind"], "cwd": l.get("cwd"),
                                 "ownerPid": l.get("owner_pid"), "up": _pid_alive(l.get("pid")),
                                 "ports": l["ports"], "projectId": l.get("project_id"),
-                                "expires": l.get("expires")} for l in self.leases.values()]}
+                                "sim": l.get("sim_udid"), "expires": l.get("expires")}
+                               for l in self.leases.values()]}
 
     def reap(self):
         with self.lock:
@@ -357,7 +413,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
         try:
             if self.path == "/acquire":
                 return self._send(200, b.acquire(d["cwd"], d.get("owner_pid"), d.get("owner_start"),
-                                                 d.get("only"), d.get("ttl", DEFAULT_TTL)))
+                                                 d.get("only"), d.get("ttl", DEFAULT_TTL),
+                                                 d.get("metro", False), d.get("sim", False),
+                                                 d.get("sim_device"), d.get("sim_runtime")))
             if self.path == "/allocate":
                 return self._send(200, b.allocate(d.get("owner_pid"), d.get("owner_start"),
                                                   d.get("ttl", DEFAULT_TTL), d.get("label")))
@@ -442,6 +500,7 @@ def _resolve_cwd(opts):
 
 def _print(out, fmt):
     ports, pid = out.get("ports", {}), out.get("projectId")
+    sim = out.get("sim")
     if fmt == "json":
         print(json.dumps(out))
     elif fmt == "env":
@@ -454,13 +513,21 @@ def _print(out, fmt):
             print(f"export GCLOUD_PROJECT={pid}")
             print(f"export GOOGLE_CLOUD_PROJECT={pid}")
         for svc, port in ports.items():
+            if svc == "metro":
+                print(f"export METRO_PORT={port}")            # Expo/Metro dev server + Detox bundle URL
+                continue
             if svc in std:
                 print(f"export {std[svc]}=127.0.0.1:{port}")
             print(f"export EMULATOR_{svc.upper()}_PORT={port}")
+        if sim:
+            print(f"export DETOX_UDID={sim['udid']}")          # Detox targets this simulator by UDID
+            print(f"export DETOX_SIM_NAME={sim['name']}")
     else:
         print(f"{out.get('leaseId', '')}  ({pid})".strip())
         for svc, port in ports.items():
             print(f"    {svc:<10} 127.0.0.1:{port}")
+        if sim:
+            print(f"    {'sim':<10} {sim['name']}  {sim['udid']}")
 
 
 def _parse(args):
@@ -472,7 +539,7 @@ def _parse(args):
             if "=" in a:
                 k, v = a[2:].split("=", 1)
                 opts[k] = v
-            elif a[2:] in ("cwd", "only", "ttl", "owner", "label") and i + 1 < len(args):
+            elif a[2:] in ("cwd", "only", "ttl", "owner", "label", "sim-device", "sim-runtime") and i + 1 < len(args):
                 opts[a[2:]] = args[i + 1]
                 i += 1
             else:
@@ -506,7 +573,10 @@ def main():
         pid, start = _owner(opts)
         _print(ok(_call("POST", "/acquire", {"cwd": _resolve_cwd(opts), "owner_pid": pid,
                                              "owner_start": start, "only": only,
-                                             "ttl": int(opts.get("ttl", DEFAULT_TTL))}), "acquire"), fmt)
+                                             "ttl": int(opts.get("ttl", DEFAULT_TTL)),
+                                             "metro": "metro" in flags, "sim": "sim" in flags,
+                                             "sim_device": opts.get("sim-device"),
+                                             "sim_runtime": opts.get("sim-runtime")}), "acquire"), fmt)
     elif cmd == "down":
         if _up():
             out = _call("POST", "/release-owned", {"owner_pid": os.getppid(), "cwd": _resolve_cwd(opts)})[1]
@@ -568,6 +638,10 @@ def main():
             exp = l.get("expires")
             ttl = "" if exp is None else f"  ttl~{max(0, int(exp - time.time()))}s"
             where = f"base:{l['ports']['base']}" if l["kind"] == "reserved" else f"firestore:{l['ports'].get('firestore')}"
+            if l["kind"] != "reserved" and l["ports"].get("metro"):
+                where += f" metro:{l['ports']['metro']}"
+            if l.get("sim"):
+                where += f" sim:{l['sim'][:8]}"
             print(f"{l['leaseId']:<22} {l['kind']:<9} owner:{str(l.get('ownerPid') or '-'):<7} "
                   f"{'up' if l['up'] else '-':<3} {where}{ttl}  {l.get('cwd') or ''}")
     else:
