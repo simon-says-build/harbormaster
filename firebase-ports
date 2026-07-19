@@ -229,7 +229,18 @@ class Broker:
             elif l.get("seen_active"):
                 l["down_since"] = l.get("down_since") or now
             return bool(l.get("down_since")) and now - l["down_since"] >= RECLAIM_GRACE
-        return not (_pid_alive(l.get("pid")) and _all_open(l.get("check_ports") or _service_ports(l["ports"])))
+        # Booted suite: the process is the strong liveness signal — reap a dead
+        # process immediately. Ports are a weak signal (a single 0.5s connect can
+        # fail on a loaded machine while the suite is fine), so closed ports only
+        # reap after RECLAIM_GRACE of CONTINUOUS downtime, mirroring the
+        # reserved-lease path above.
+        if not _pid_alive(l.get("pid")):
+            return True
+        if _all_open(l.get("check_ports") or _service_ports(l["ports"])):
+            l["down_since"] = None
+            return False
+        l["down_since"] = l.get("down_since") or now
+        return now - l["down_since"] >= RECLAIM_GRACE
 
     def _free_block(self):
         used = {l["block"] for l in self.leases.values() if l.get("block")}

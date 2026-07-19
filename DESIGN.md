@@ -61,9 +61,10 @@ A lease is reclaimed when ANY of:
 2. **PID reuse guard** — "alive" means *same pid AND same start time* (`ps -o lstart`),
    so a recycled PID number doesn't keep a dead owner's sandbox alive.
 3. **TTL** — a backstop for a caller that never dies (misconfigured / detached).
-4. **Emulator liveness** — for daemon-booted suites, if the emulator ports go down; for
-   reserved (caller-booted) blocks, once the block's core ports have been up and then
-   stay down past a grace window.
+4. **Emulator liveness** — dead suite process → reaped immediately; ports down (with
+   the process alive) only reap after a grace window of continuous downtime, for both
+   daemon-booted suites and reserved (caller-booted) blocks. A single failed connect
+   check on a loaded machine must never kill a healthy suite.
 
 Teardown always `killpg`s the whole process group so the emulator's **JVM children are
 reaped** — a v1 bug leaked Firestore/Storage JVMs because only the node parent was
