@@ -111,7 +111,14 @@ def _owner_alive(pid, start):
         return True                       # no owner tracking → rely on TTL / liveness
     if not _pid_alive(pid):
         return False
-    return not start or _proc_start(pid) == start
+    if not start:
+        return True
+    observed = _proc_start(pid)
+    # `ps` can time out on a loaded machine (exactly when a lease is booting).
+    # An unreadable start time is NOT evidence of PID reuse — the pid exists
+    # (os.kill(0) just succeeded), so treat indeterminate as alive rather than
+    # reaping a healthy lease.
+    return not observed or observed == start
 
 
 def _tail(path, n=25):
@@ -212,35 +219,50 @@ class Broker:
 
     def _reconcile(self):
         for lid in list(self.leases):
-            if self._dead(self.leases[lid], time.time()):
+            reason = self._dead_reason(self.leases[lid], time.time())
+            if reason:
+                print(f"reaping {lid}: {reason}", flush=True)
                 self._cleanup(self.leases.pop(lid))
         self._save()
 
     def _dead(self, l, now):
+        return bool(self._dead_reason(l, now))
+
+    def _dead_reason(self, l, now):
         if l.get("owner_pid") is not None and not _owner_alive(l["owner_pid"], l.get("owner_start")):
-            return True
+            return f"owner pid {l['owner_pid']} gone"
         exp = l.get("expires")
         if exp is not None and exp < now:
-            return True
+            # TTL is a backstop for callers the daemon can't track (no owner)
+            # and for reserved blocks (documented: reserved leases reap on TTL
+            # even with a live owner). A BOOTED lease whose tracked owner is
+            # verifiably alive is not orphaned — let owner-death/liveness
+            # govern it instead of killing a healthy hour-old dev-env.
+            if l["kind"] == "reserved" or l.get("owner_pid") is None:
+                return "ttl expired"
         if l["kind"] == "reserved":       # caller boots its own — liveness on the block
             base = l["block"]
             if _port_open(base) or _port_open(base + 1):
                 l["seen_active"], l["down_since"] = True, None
             elif l.get("seen_active"):
                 l["down_since"] = l.get("down_since") or now
-            return bool(l.get("down_since")) and now - l["down_since"] >= RECLAIM_GRACE
+            if l.get("down_since") and now - l["down_since"] >= RECLAIM_GRACE:
+                return "reserved block down past grace"
+            return None
         # Booted suite: the process is the strong liveness signal — reap a dead
         # process immediately. Ports are a weak signal (a single 0.5s connect can
         # fail on a loaded machine while the suite is fine), so closed ports only
         # reap after RECLAIM_GRACE of CONTINUOUS downtime, mirroring the
         # reserved-lease path above.
         if not _pid_alive(l.get("pid")):
-            return True
+            return f"suite pid {l.get('pid')} died"
         if _all_open(l.get("check_ports") or _service_ports(l["ports"])):
             l["down_since"] = None
-            return False
+            return None
         l["down_since"] = l.get("down_since") or now
-        return now - l["down_since"] >= RECLAIM_GRACE
+        if now - l["down_since"] >= RECLAIM_GRACE:
+            return "ports down past grace"
+        return None
 
     def _free_block(self):
         used = {l["block"] for l in self.leases.values() if l.get("block")}
