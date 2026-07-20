@@ -738,7 +738,9 @@ def main():
             sys.exit(1)
         return out
 
-    if cmd == "serve":
+    if cmd == "version":
+        print(VERSION)
+    elif cmd == "serve":
         cmd_serve()
     elif cmd in ("acquire", "up"):
         _ensure()
