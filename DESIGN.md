@@ -43,15 +43,34 @@ acquire { cwd, owner_pid, owner_start, only? }  ->  { leaseId, ports, projectId 
   `GCLOUD_PROJECT`). There is no shared "project ports" lookup, because there is no
   shared instance.
 
-## Two flavors
+## Three flavors
 
 - **`acquire` — the daemon boots the suite.** For callers that just want a working
   backend (a test process, an interactive dev shell). Returns the ports.
 - **`allocate` — the daemon reserves a block; the caller boots its own suite.** For the
   agent-qa run driver (`envs/_lib/backends/firebase-emulators.sh`), which has bespoke
   build/wipe/seed logic. Returns a base; the driver derives ports by the block offsets.
+- **`allocate --spawn CMD` — the daemon RUNS the lease's process.** For long-lived
+  dev-env processes (Metro for e2e) that must outlive the calling shell — in
+  particular agent sessions, whose harness kills any process the agent backgrounds.
+  The lease is ownerless (daemon-owned): liveness is the spawned pid (zombie-aware —
+  the daemon `waitpid`s its own children, since a zombie passes `kill -0`), the TTL is
+  the backstop, and `release <id>` is the off switch. Spawn output goes to the lease
+  log in the state dir.
 
-Both carry an `owner_pid` and are reaped the same way.
+`acquire` and plain `allocate` carry an `owner_pid` and are reaped the same way;
+`--spawn`/`--detach` leases have no owner by design.
+
+## Daemon version handover
+
+Any copy of the CLI (a global install, a repo checkout, some project's
+`node_modules`) may be the first to start the daemon, so the daemon on port 4999 can
+be arbitrarily stale. `/health` reports the daemon version; `_ensure` in a NEWER
+client POSTs `/shutdown` to an older daemon and starts its own copy. This is safe by
+construction: leases live in the ledger on disk, and every leased process (suites,
+spawns) runs in its own session via `start_new_session`, so the successor daemon
+reloads the ledger and carries on — the handover tears nothing down. Older clients
+never downgrade a newer daemon.
 
 ## Ownership & teardown (coordinated only — never `pkill`)
 

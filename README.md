@@ -52,11 +52,25 @@ firebase-ports exec --cwd ./my-app --only auth,firestore "npm test"
 # Reserve a block WITHOUT booting — for a caller that starts its own suite:
 firebase-ports allocate --json          # → { "leaseId": "...", "base": 11000 }
 
+# Have the DAEMON run a long-lived process (Metro, a dev server) as the lease:
+# daemon-owned, so it survives the calling shell / agent session. Liveness is the
+# spawned pid (+ TTL backstop); stop it with `release`. CMD sees METRO_PORT,
+# DETOX_UDID/DETOX_SIM_NAME (with --sim), FBPORTS_BLOCK_BASE, FBPORTS_LEASE_ID.
+eval "$(firebase-ports allocate --sim --ttl 604800 \
+        --spawn 'exec npx expo start --port "$METRO_PORT"' --cwd ./my-app --env)"
+firebase-ports release "$FBPORTS_LEASE_ID"   # tears down Metro + the sim
+
 firebase-ports status                    # everything the daemon has out
 firebase-ports down --cwd ./my-app       # release this shell's lease early
 ```
 
 `--json` on `acquire`/`allocate` returns the ports/base as JSON for scripting.
+
+Version skew is self-healing: the daemon reports its version on `/health`, and a
+newer client replaces an older daemon in place (leases persist in the ledger;
+every leased process runs in its own session, so nothing is torn down by the
+handover). A stale `node_modules` copy can no longer pin the machine to an old
+daemon.
 
 ## How it works
 

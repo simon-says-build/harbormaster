@@ -19,13 +19,21 @@ independent suites, so they never collide on ports or data.
   down [--cwd DIR]       Release this shell's sandbox for DIR (else it's reaped on exit).
   release <leaseId>      Release a specific lease.
   status                 Everything the daemon has out.
-  allocate [--owner PID] [--ttl N] [--metro] [--sim] [--json|--env]
+  allocate [--owner PID] [--ttl N] [--metro] [--sim] [--spawn CMD] [--cwd DIR]
+           [--detach] [--json|--env]
         Reserve a block WITHOUT booting — for a caller that boots its own suite (the
         agent-qa run driver). Also owner-reaped. --metro/--sim work as on acquire
         (metro port in the block; private simulator, deleted on reap) for e2e Metro
         sessions whose emulators are per-RUN acquires. NOTE: reserved leases also
         reap on TTL even with a live owner — pass a long --ttl for long-lived
         Metro sessions (owner death still reaps promptly).
+        --spawn CMD makes the DAEMON run CMD (via sh -c, in --cwd if given) as the
+        lease's process: daemon-owned, so it survives the calling shell/agent —
+        liveness is the spawned pid (+ TTL backstop), teardown kills its process
+        group, stdout goes to the lease log. CMD sees FBPORTS_BLOCK_BASE,
+        FBPORTS_LEASE_ID, and METRO_PORT / DETOX_UDID / DETOX_SIM_NAME when leased.
+        With --spawn (or --detach) the lease has NO owner pid — release it with
+        `firebase-ports release <leaseId>` or let the TTL reap it.
   exec [--cwd DIR] [--only a,b] '<script>'
         Run `firebase emulators:exec` on a daemon-allocated block: boots the suite on
         free ports, runs the script (which gets FIRESTORE_EMULATOR_HOST etc.), tears
@@ -52,9 +60,13 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-STATE_DIR = Path.home() / ".local" / "state" / "firebase-ports"
+VERSION = "0.3.0"
+
+# Overridable for tests / parallel installs; default is the shared user daemon.
+STATE_DIR = Path(os.environ.get("FBPORTS_STATE_DIR",
+                                str(Path.home() / ".local" / "state" / "firebase-ports")))
 LEDGER = STATE_DIR / "ledger.json"
-BROKER_HOST, BROKER_PORT = "127.0.0.1", 4999
+BROKER_HOST, BROKER_PORT = "127.0.0.1", int(os.environ.get("FBPORTS_PORT", "4999"))
 POOL_BASE, BLOCK, POOL_BLOCKS = 11000, 20, 200          # blocks of 20 ports, 11000-14999
 BLOCK_OFFSETS = {"auth": 0, "firestore": 1, "functions": 2, "storage": 3, "ui": 4,
                  "hub": 5, "logging": 6, "pubsub": 7, "eventarc": 8, "database": 9,
@@ -91,8 +103,24 @@ def _pid_alive(pid):
     try:
         os.kill(int(pid), 0)
         return True
+    except PermissionError:
+        return True                       # EPERM: exists, just not ours to signal
     except (OSError, ProcessLookupError, ValueError, TypeError):
         return False
+
+
+def _child_alive(pid):
+    """Liveness for a process the DAEMON spawned. A zombie child passes kill-0
+    until someone waits on it, so reap it first (WNOHANG); if it exited, it's
+    dead. After a daemon restart the process is no longer our child
+    (ECHILD) — launchd reaps it instead, so plain kill-0 is then correct."""
+    try:
+        done, _ = os.waitpid(int(pid), os.WNOHANG)
+        if done == int(pid):
+            return False
+    except (ChildProcessError, OSError, ValueError, TypeError):
+        pass
+    return _pid_alive(pid)
 
 
 def _proc_start(pid):
@@ -240,7 +268,14 @@ class Broker:
             # govern it instead of killing a healthy hour-old dev-env.
             if l["kind"] == "reserved" or l.get("owner_pid") is None:
                 return "ttl expired"
-        if l["kind"] == "reserved":       # caller boots its own — liveness on the block
+        if l["kind"] == "reserved":
+            # Daemon-spawned process (--spawn): its pid IS the lease's liveness —
+            # ports are irrelevant (Metro restarting/compiling must not reap it).
+            if l.get("pid"):
+                if not _child_alive(l["pid"]):
+                    return f"spawned pid {l['pid']} died"
+                return None
+            # Caller boots its own — liveness on the block.
             base = l["block"]
             if _port_open(base) or _port_open(base + 1):
                 l["seen_active"], l["down_since"] = True, None
@@ -254,7 +289,7 @@ class Broker:
         # fail on a loaded machine while the suite is fine), so closed ports only
         # reap after RECLAIM_GRACE of CONTINUOUS downtime, mirroring the
         # reserved-lease path above.
-        if not _pid_alive(l.get("pid")):
+        if not _child_alive(l.get("pid")):
             return f"suite pid {l.get('pid')} died"
         if _all_open(l.get("check_ports") or _service_ports(l["ports"])):
             l["down_since"] = None
@@ -309,17 +344,20 @@ class Broker:
     def _cleanup(self, rec):
         """Coordinated teardown — killpg the whole group so JVM children die too. Never pkill."""
         pid = rec.get("pid")
-        if _pid_alive(pid):
+        # _child_alive, not _pid_alive: a daemon-spawned process that already
+        # exited lingers as our zombie child, which passes kill-0 — treating it
+        # as alive would stall this loop through a futile TERM+KILL cycle.
+        if _child_alive(pid):
             for sig in (signal.SIGTERM, signal.SIGKILL):
                 try:
                     os.killpg(os.getpgid(int(pid)), sig)
                 except (OSError, ProcessLookupError):
                     break
                 for _ in range(50):
-                    if not _pid_alive(pid):
+                    if not _child_alive(pid):
                         break
                     time.sleep(0.1)
-                if not _pid_alive(pid):
+                if not _child_alive(pid):
                     break
         tmp = rec.get("tmp_config")
         if tmp and rec.get("cwd") and (Path(rec["cwd"]) / tmp).exists():
@@ -362,7 +400,8 @@ class Broker:
             return resp
 
     def allocate(self, owner_pid, owner_start=None, ttl=DEFAULT_TTL, label=None,
-                 metro=False, sim=False, sim_device=None, sim_runtime=None):
+                 metro=False, sim=False, sim_device=None, sim_runtime=None,
+                 spawn=None, spawn_cwd=None):
         with self.lock:
             base = self._free_block()
             lid = f"alloc:{uuid.uuid4().hex[:12]}"
@@ -379,15 +418,50 @@ class Broker:
                 sim_name = lid.replace(":", "-")
                 sim_udid = _sim_create_boot(sim_device or DEFAULT_SIM_DEVICE,
                                             sim_runtime or DEFAULT_SIM_RUNTIME, sim_name)
-            self.leases[lid] = {"leaseId": lid, "kind": "reserved", "cwd": None, "block": base,
-                                "ports": ports, "pid": None, "owner_pid": owner_pid,
-                                "owner_start": owner_start, "tmp_config": None, "log": None,
+            # --spawn: the DAEMON runs the lease's process (Metro, a dev server…),
+            # so it survives the calling shell/agent/session. Its pid is the
+            # lease's liveness; teardown killpgs it like a booted suite.
+            pid = None
+            log = None
+            if spawn:
+                log = str(STATE_DIR / f"{lid.replace(':', '-')}.log")
+                env = {**os.environ,
+                       "FBPORTS_BLOCK_BASE": str(base),
+                       "FBPORTS_LEASE_ID": lid}
+                if ports.get("metro"):
+                    env["METRO_PORT"] = str(ports["metro"])
+                if sim_udid:
+                    env["DETOX_UDID"] = sim_udid
+                    env["DETOX_SIM_NAME"] = sim_name
+                try:
+                    with open(log, "w") as lf:
+                        proc = subprocess.Popen(["/bin/sh", "-c", spawn],
+                                                cwd=spawn_cwd or None, env=env,
+                                                stdout=lf, stderr=subprocess.STDOUT,
+                                                start_new_session=True)
+                    pid = proc.pid
+                except OSError:
+                    # Don't leak the simulator we just created if the spawn fails.
+                    if sim_udid:
+                        _sim_teardown(sim_udid)
+                    raise
+            print(f"leased {lid} ({label or 'no label'}): base {base}"
+                  f"{f' sim {sim_name}' if sim_udid else ''}"
+                  f"{f' spawned pid {pid}' if pid else ''}", flush=True)
+            self.leases[lid] = {"leaseId": lid, "kind": "reserved", "cwd": spawn_cwd,
+                                "block": base, "ports": ports, "pid": pid,
+                                "owner_pid": owner_pid,
+                                "owner_start": owner_start, "tmp_config": None,
+                                "log": log, "spawn": spawn,
                                 "label": label, "sim_udid": sim_udid, "sim_name": sim_name,
                                 "started": _now(), "expires": time.time() + ttl}
             self._save()
             resp = {"leaseId": lid, "base": base, "ports": ports}
             if sim_udid:
                 resp["sim"] = {"udid": sim_udid, "name": sim_name}
+            if pid:
+                resp["spawnedPid"] = pid
+                resp["log"] = log
             return resp
 
     def release(self, lid):
@@ -395,6 +469,7 @@ class Broker:
             rec = self.leases.pop(lid, None)
             if not rec:
                 return {"released": False, "reason": "unknown lease"}
+            print(f"released {lid} ({rec.get('label') or rec.get('cwd') or 'no label'})", flush=True)
             self._cleanup(rec)
             self._save()
             return {"released": True}
@@ -423,7 +498,8 @@ class Broker:
             return {"leases": [{"leaseId": l["leaseId"], "kind": l["kind"], "cwd": l.get("cwd"),
                                 "ownerPid": l.get("owner_pid"), "up": _pid_alive(l.get("pid")),
                                 "ports": l["ports"], "projectId": l.get("project_id"),
-                                "sim": l.get("sim_udid"), "expires": l.get("expires")}
+                                "sim": l.get("sim_udid"), "expires": l.get("expires"),
+                                "label": l.get("label"), "log": l.get("log")}
                                for l in self.leases.values()]}
 
     def reap(self):
@@ -458,7 +534,7 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/health":
-            return self._send(200, {"ok": True})
+            return self._send(200, {"ok": True, "version": VERSION})
         if self.path == "/status":
             return self._send(200, self.broker.status())
         self._send(404, {"error": "not found"})
@@ -475,7 +551,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, b.allocate(d.get("owner_pid"), d.get("owner_start"),
                                                   d.get("ttl", DEFAULT_TTL), d.get("label"),
                                                   d.get("metro", False), d.get("sim", False),
-                                                  d.get("sim_device"), d.get("sim_runtime")))
+                                                  d.get("sim_device"), d.get("sim_runtime"),
+                                                  d.get("spawn"), d.get("spawn_cwd")))
             if self.path == "/release":
                 return self._send(200, b.release(d.get("leaseId")))
             if self.path == "/release-owned":
@@ -504,8 +581,8 @@ def cmd_serve():
                 pass
 
     threading.Thread(target=reaper, daemon=True).start()
-    print(f"firebase-ports daemon on http://{BROKER_HOST}:{BROKER_PORT} "
-          f"(pool {POOL_BASE}-{POOL_BASE + POOL_BLOCKS * BLOCK - 1})")
+    print(f"firebase-ports {VERSION} daemon on http://{BROKER_HOST}:{BROKER_PORT} "
+          f"(pool {POOL_BASE}-{POOL_BASE + POOL_BLOCKS * BLOCK - 1})", flush=True)
     srv.serve_forever()
 
 
@@ -528,12 +605,50 @@ def _up():
         return False
 
 
-def _ensure():
-    if _up():
-        return
+def _daemon_version():
+    """The running daemon's version, '0' for pre-0.3 daemons, None if not running."""
+    try:
+        st, out = _call("GET", "/health", timeout=1)
+        return (out.get("version") or "0") if st == 200 else None
+    except OSError:
+        return None
+
+
+def _ver_tuple(v):
+    try:
+        return tuple(int(x) for x in str(v).split("."))
+    except ValueError:
+        return (0,)
+
+
+def _spawn_daemon():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log = open(STATE_DIR / "daemon.log", "a")
     subprocess.Popen([sys.argv[0], "serve"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+
+
+def _ensure():
+    v = _daemon_version()
+    if v is not None:
+        if _ver_tuple(v) >= _ver_tuple(VERSION):
+            return
+        # A newer client found an older daemon (e.g. a stale node_modules copy
+        # started it). Replace it: leases persist in the ledger and every leased
+        # process (suites, spawns) runs in its own session, so the successor
+        # daemon reloads them and carries on — nothing is torn down.
+        try:
+            _call("POST", "/shutdown", timeout=5)
+        except OSError:
+            pass
+        for _ in range(50):
+            if not _up():
+                break
+            time.sleep(0.1)
+        if _up():
+            raise RuntimeError(
+                f"daemon {v} is older than this client ({VERSION}) and did not "
+                f"shut down — kill the 'firebase-ports serve' process and retry")
+    _spawn_daemon()
     for _ in range(50):
         if _up():
             return
@@ -596,7 +711,7 @@ def _parse(args):
             if "=" in a:
                 k, v = a[2:].split("=", 1)
                 opts[k] = v
-            elif a[2:] in ("cwd", "only", "ttl", "owner", "label", "sim-device", "sim-runtime") and i + 1 < len(args):
+            elif a[2:] in ("cwd", "only", "ttl", "owner", "label", "sim-device", "sim-runtime", "spawn") and i + 1 < len(args):
                 opts[a[2:]] = args[i + 1]
                 i += 1
             else:
@@ -623,7 +738,9 @@ def main():
             sys.exit(1)
         return out
 
-    if cmd == "serve":
+    if cmd == "version":
+        print(VERSION)
+    elif cmd == "serve":
         cmd_serve()
     elif cmd in ("acquire", "up"):
         _ensure()
@@ -648,27 +765,40 @@ def main():
             print("nothing to release")
     elif cmd == "allocate":
         _ensure()
-        pid, start = _owner(opts)
+        spawn = opts.get("spawn")
+        # A daemon-spawned or explicitly-detached lease has no owner: it outlives
+        # the calling shell/agent by design and is governed by pid liveness + TTL.
+        if (spawn or "detach" in flags) and not opts.get("owner"):
+            pid, start = None, None
+        else:
+            pid, start = _owner(opts)
         out = ok(_call("POST", "/allocate", {"owner_pid": pid, "owner_start": start,
                                              "ttl": int(opts.get("ttl", DEFAULT_TTL)),
                                              "label": opts.get("label"),
                                              "metro": "metro" in flags, "sim": "sim" in flags,
                                              "sim_device": opts.get("sim-device"),
-                                             "sim_runtime": opts.get("sim-runtime")}), "allocate")
+                                             "sim_runtime": opts.get("sim-runtime"),
+                                             "spawn": spawn,
+                                             "spawn_cwd": str(Path(opts["cwd"]).resolve()) if opts.get("cwd") else None}),
+                 "allocate")
         if fmt == "env":
             # Reserved block, nothing booted — emit only the dev-env extras (plus
             # the base for callers that derive their own ports from it).
             print(f"export FBPORTS_BLOCK_BASE={out['base']}")
+            print(f"export FBPORTS_LEASE_ID={out['leaseId']}")
             if out.get("ports", {}).get("metro"):
                 print(f"export METRO_PORT={out['ports']['metro']}")
             if out.get("sim"):
                 print(f"export DETOX_UDID={out['sim']['udid']}")
                 print(f"export DETOX_SIM_NAME={out['sim']['name']}")
+            if out.get("log"):
+                print(f"export FBPORTS_SPAWN_LOG={out['log']}")
         elif fmt == "json":
             print(json.dumps(out))
         else:
             extra = f"  metro {out['ports']['metro']}" if out.get("ports", {}).get("metro") else ""
             extra += f"  sim {out['sim']['udid']}" if out.get("sim") else ""
+            extra += f"  spawned pid {out['spawnedPid']}" if out.get("spawnedPid") else ""
             print(f"{out['leaseId']}  base {out['base']}{extra}")
     elif cmd == "exec":
         # firebase-ports exec [--cwd DIR] [--only a,b] '<script>'
@@ -718,7 +848,8 @@ def main():
             if l.get("sim"):
                 where += f" sim:{l['sim'][:8]}"
             print(f"{l['leaseId']:<22} {l['kind']:<9} owner:{str(l.get('ownerPid') or '-'):<7} "
-                  f"{'up' if l['up'] else '-':<3} {where}{ttl}  {l.get('cwd') or ''}")
+                  f"{'up' if l['up'] else '-':<3} {where}{ttl}  "
+                  f"{l.get('label') or ''}  {l.get('cwd') or ''}".rstrip())
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
         print("Commands: acquire, up, down, release, allocate, status, leases, serve", file=sys.stderr)
