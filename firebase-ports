@@ -39,6 +39,10 @@ independent suites, so they never collide on ports or data.
         free ports, runs the script (which gets FIRESTORE_EMULATOR_HOST etc.), tears
         down. Use this instead of a bare `firebase emulators:exec` so concurrent runs
         don't collide.
+  verify <leaseId>       Exit 0 iff the lease is FULLY alive: known to the daemon,
+        its process running, its simulator still present, and (for booted suites)
+        its ports open. The reuse gate for long-lived sessions:
+            firebase-ports verify "$FBPORTS_LEASE_ID" || <re-lease>
   serve                  Run the daemon (auto-starts on first command).
 
 NOTE: firebase.json ports are optional — the daemon injects (and overrides) a
@@ -60,7 +64,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 STATE_DIR = Path(os.environ.get("FBPORTS_STATE_DIR",
@@ -82,6 +86,10 @@ DEFAULT_SIM_RUNTIME = os.environ.get("FBPORTS_SIM_RUNTIME",
 DEFAULT_TTL = 3600
 RECLAIM_GRACE = int(os.environ.get("FBPORTS_RECLAIM_GRACE", "45"))
 REAP_INTERVAL = int(os.environ.get("FBPORTS_REAP_INTERVAL", "10"))
+# How often the reaper cross-checks leased simulators against simctl. A lease
+# whose sim was deleted externally is broken for its caller even if its process
+# is healthy — sweep it whole rather than leave a half-alive session.
+SIM_CHECK_INTERVAL = int(os.environ.get("FBPORTS_SIM_CHECK_INTERVAL", "60"))
 BOOT_BACKSTOP = 600          # only for a genuinely wedged boot; readiness is liveness-driven
 
 
@@ -214,6 +222,22 @@ def _sim_create_boot(device, runtime, name):
     subprocess.run(["xcrun", "simctl", "boot", udid], capture_output=True, text=True, timeout=120)
     subprocess.run(["xcrun", "simctl", "bootstatus", udid, "-b"], capture_output=True, text=True, timeout=300)
     return udid
+
+
+def _sim_udids():
+    """The set of simulator UDIDs simctl knows, or None when indeterminate.
+    simctl erroring/missing must never read as 'every sim is gone' — callers
+    treat None as 'no evidence', mirroring _owner_alive's philosophy."""
+    try:
+        r = subprocess.run(["xcrun", "simctl", "list", "devices", "-j"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return None
+        devices = json.loads(r.stdout).get("devices", {})
+        return {d["udid"] for lst in devices.values() for d in lst if d.get("udid")}
+    except (subprocess.SubprocessError, OSError, json.JSONDecodeError,
+            AttributeError, TypeError):
+        return None
 
 
 def _sim_teardown(udid):
@@ -508,7 +532,55 @@ class Broker:
             for lid in list(self.leases):
                 if self._dead(self.leases[lid], now):
                     self._cleanup(self.leases.pop(lid))
+            self._reap_deleted_sims(now)
             self._save()
+
+    def _reap_deleted_sims(self, now):
+        """Reap leases whose simulator was deleted externally (Xcode cleanup,
+        `simctl delete/erase`, a stray reset). The lease is broken for its
+        caller even though its process is healthy; reaping it WHOLE (killing
+        the spawn too) prevents the half-alive ghost: sim gone, Metro still
+        squatting its port, callers 'reusing' a session Detox can't drive.
+        Throttled — one simctl listing per SIM_CHECK_INTERVAL, not per lease."""
+        if now - getattr(self, "_sims_checked", 0) < SIM_CHECK_INTERVAL:
+            return
+        sim_leases = [lid for lid, l in self.leases.items() if l.get("sim_udid")]
+        if not sim_leases:
+            self._sims_checked = now
+            return
+        udids = _sim_udids()
+        if udids is None:
+            return                        # indeterminate — no evidence, retry next pass
+        self._sims_checked = now
+        for lid in sim_leases:
+            l = self.leases.get(lid)
+            if l and l["sim_udid"] not in udids:
+                print(f"reaping {lid}: sim {l['sim_udid']} deleted externally", flush=True)
+                self._cleanup(self.leases.pop(lid))
+
+    def verify(self, lid):
+        """Full-liveness check for one lease, for callers deciding whether to
+        REUSE a session rather than re-lease: known to the daemon + process
+        alive + simulator present + (booted suites) ports open. Read-only —
+        never tears anything down."""
+        with self.lock:
+            l = self.leases.get(lid)
+            if not l:
+                return {"ok": False, "reasons": ["unknown lease"]}
+            reasons = []
+            pid = l.get("pid")
+            if pid and not _child_alive(pid):
+                reasons.append(f"process {pid} dead")
+            if l.get("sim_udid"):
+                udids = _sim_udids()
+                if udids is not None and l["sim_udid"] not in udids:
+                    reasons.append(f"sim {l['sim_udid']} gone")
+            if l["kind"] == "acquired":
+                down = [s for s, p in (l.get("check_ports") or _service_ports(l["ports"])).items()
+                        if not _port_open(p)]
+                if down:
+                    reasons.append("ports down: " + ",".join(sorted(down)))
+            return {"ok": not reasons, "reasons": reasons}
 
 
 class _Handler(http.server.BaseHTTPRequestHandler):
@@ -559,6 +631,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, b.release_owned(d.get("owner_pid"), d.get("cwd")))
             if self.path == "/heartbeat":
                 return self._send(200, b.heartbeat(d.get("leaseId"), d.get("ttl", DEFAULT_TTL)))
+            if self.path == "/verify":
+                return self._send(200, b.verify(d.get("leaseId")))
             if self.path == "/shutdown":
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return self._send(200, {"ok": True})
@@ -831,6 +905,20 @@ def main():
             if p.exists():
                 p.unlink()
         sys.exit(rc)
+    elif cmd == "verify":
+        # verify <leaseId> — exit 0 iff the lease is FULLY alive. The reuse
+        # gate for long-lived sessions (e2e Metro + sim): anything less than
+        # fully alive means tear down what's left and re-lease.
+        if not pos:
+            print("usage: firebase-ports verify <leaseId>", file=sys.stderr)
+            sys.exit(2)
+        _ensure()                          # also upgrades an older daemon first
+        out = _call("POST", "/verify", {"leaseId": pos[0]})[1]
+        if out.get("ok"):
+            print("ok")
+        else:
+            print("; ".join(out.get("reasons") or [out.get("error", "not ok")]))
+            sys.exit(1)
     elif cmd in ("status", "leases"):
         if not _up():
             print("daemon not running.")
@@ -852,7 +940,7 @@ def main():
                   f"{l.get('label') or ''}  {l.get('cwd') or ''}".rstrip())
     else:
         print(f"Unknown command: {cmd}", file=sys.stderr)
-        print("Commands: acquire, up, down, release, allocate, status, leases, serve", file=sys.stderr)
+        print("Commands: acquire, up, down, release, allocate, verify, status, leases, serve", file=sys.stderr)
         sys.exit(1)
 
 
