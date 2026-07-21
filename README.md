@@ -60,6 +60,11 @@ eval "$(firebase-ports allocate --sim --ttl 604800 \
         --spawn 'exec npx expo start --port "$METRO_PORT"' --cwd ./my-app --env)"
 firebase-ports release "$FBPORTS_LEASE_ID"   # tears down Metro + the sim
 
+# Reuse gate for long-lived sessions: exit 0 iff the lease is FULLY alive
+# (known to the daemon, process running, sim still present, ports up) — anything
+# less means clean up your session state and re-lease:
+firebase-ports verify "$FBPORTS_LEASE_ID" || re_lease
+
 firebase-ports status                    # everything the daemon has out
 firebase-ports down --cwd ./my-app       # release this shell's lease early
 ```
@@ -71,6 +76,12 @@ newer client replaces an older daemon in place (leases persist in the ledger;
 every leased process runs in its own session, so nothing is torn down by the
 handover). A stale `node_modules` copy can no longer pin the machine to an old
 daemon.
+
+Leased simulators are part of a lease's liveness: if a sim is deleted externally
+(Xcode cleanup, `simctl delete`, a device reset), the reaper notices within
+`FBPORTS_SIM_CHECK_INTERVAL` (60s) and reaps the lease *whole* — killing its
+spawned process too — so a half-alive session (sim gone, Metro still squatting
+its port) can never linger for callers to "reuse".
 
 ## How it works
 
