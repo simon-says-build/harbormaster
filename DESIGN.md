@@ -59,7 +59,16 @@ acquire { cwd, owner_pid, owner_start, only? }  ->  { leaseId, ports, projectId 
   log in the state dir.
 
 `acquire` and plain `allocate` carry an `owner_pid` and are reaped the same way;
-`--spawn`/`--detach` leases have no owner by design.
+`--spawn`/`--detach` leases default to no owner, because their *immediate* parent
+exits within seconds of the call and would reap the lease with it.
+
+That default proved too coarse. "Daemonised" decides who reaps the child; it does
+not mean nobody is interested. `--owner auto` walks up from the CLI past the
+transient shell/npm wrappers and records the first ancestor that outlives the
+call — under an agent harness, the agent process — so the lease dies with that
+session instead of lingering for its full multi-day TTL. It deliberately returns
+*no* owner when the walk reaches a boundary like an editor or a login session,
+rather than pretending a process that lives for days is a meaningful owner.
 
 ## Daemon version handover
 
@@ -79,8 +88,13 @@ A lease is reclaimed when ANY of:
 1. **Owner death** — `owner_pid` is gone. This is the primary, expected path.
 2. **PID reuse guard** — "alive" means *same pid AND same start time* (`ps -o lstart`),
    so a recycled PID number doesn't keep a dead owner's sandbox alive.
-3. **TTL** — a backstop for a caller that never dies (misconfigured / detached).
-4. **Emulator liveness** — dead suite process → reaped immediately; ports down (with
+3. **Working directory gone** — the lease's `cwd` no longer exists. A deleted
+   worktree can never need its Metro again, and this is the one signal that is
+   unambiguous for daemon-spawned leases. Only a *confirmed* absence counts: if
+   the parent directory is missing too, that reads as an unmounted volume rather
+   than a deleted project, and the lease is left alone.
+4. **TTL** — a backstop for a caller that never dies (misconfigured / detached).
+5. **Emulator liveness** — dead suite process → reaped immediately; ports down (with
    the process alive) only reap after a grace window of continuous downtime, for both
    daemon-booted suites and reserved (caller-booted) blocks. A single failed connect
    check on a loaded machine must never kill a healthy suite.
