@@ -71,7 +71,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
