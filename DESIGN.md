@@ -1,4 +1,4 @@
-# firebase-ports — design (v2: caller-owned sandboxes)
+# harbormaster — design (v2: caller-owned sandboxes)
 
 Status: **live on `main`.** Caller-owned sandboxes are the shipped model. Validated
 end-to-end: acquire/exec boot + owner-death reap + PID-reuse guard, and concurrent
@@ -106,7 +106,7 @@ killed (verify this in v2). The daemon owns lifecycle end-to-end; callers use
 
 ## Owning PID is the caller, not the CLI
 
-`firebase-ports acquire` is ephemeral — it exits the moment it has the response. So the
+`harbormaster acquire` is ephemeral — it exits the moment it has the response. So the
 CLI defaults `owner_pid` to **its parent** (`os.getppid()` — the calling shell or test
 runner), or the caller passes `--owner PID` explicitly (`$$` in a shell, `process.pid`
 in node). The sandbox lives as long as that owner does.
@@ -130,13 +130,13 @@ eventarc=+8 database=+9` (kept in sync with the run driver's derivation).
 
 ## What changes from v1
 
-- Drop the registry (`~/.config/firebase-ports.json`) and `list`/`apply`/`check`.
+- Drop the registry (`~/.config/harbormaster.json`) and `list`/`apply`/`check`.
 - Drop sticky-per-project (`up`/`ports` as a shared instance). Everything is a
   caller-owned lease.
 - `firebase.json` everywhere is portless (already done for agent-qa/impulse/walk2gether/
   tuturno on their branches).
 - Consumers (`app.config`, scrub scripts, CLAUDE.md tables) stop hard-coding ports and
-  instead `eval "$(firebase-ports acquire --cwd . --env)"` (owner = their process).
+  instead `eval "$(harbormaster acquire --cwd . --env)"` (owner = their process).
 
 ## Open items before this goes live
 

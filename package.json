@@ -1,20 +1,24 @@
 {
-  "name": "firebase-ports",
-  "version": "0.5.0",
-  "description": "A localhost daemon that hands each caller its own isolated Firebase emulator sandbox — pool-assigned ports, fresh data, reaped when the caller exits. No port collisions, no shared instances, no pkill.",
+  "name": "harbormaster",
+  "version": "0.6.0",
+  "description": "A localhost daemon that leases each caller its own port block — isolated Firebase emulator sandboxes, Metro/Expo ports, private iOS simulators — reaped when the caller exits. No port collisions, no shared instances, no pkill. Formerly firebase-ports.",
   "bin": {
-    "firebase-ports": "firebase-ports"
+    "harbormaster": "harbormaster",
+    "firebase-ports": "harbormaster"
   },
   "files": [
-    "firebase-ports",
+    "harbormaster",
     "DESIGN.md",
-    "firebase-ports.example.json"
+    "harbormaster.example.json"
   ],
   "keywords": [
     "firebase",
     "firebase-emulator",
     "emulators",
+    "metro",
+    "expo",
     "ports",
+    "port-lease",
     "testing",
     "ci",
     "detox"
@@ -23,11 +27,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/michaeldawson/firebase-ports.git"
+    "url": "git+https://github.com/simon-says-build/harbormaster.git"
   },
-  "homepage": "https://github.com/michaeldawson/firebase-ports#readme",
+  "homepage": "https://github.com/simon-says-build/harbormaster#readme",
   "bugs": {
-    "url": "https://github.com/michaeldawson/firebase-ports/issues"
+    "url": "https://github.com/simon-says-build/harbormaster/issues"
   },
   "os": [
     "darwin",

@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""firebase-ports — caller-owned Firebase emulator sandboxes.
+"""harbormaster — caller-owned port leases: Firebase emulator sandboxes, Metro
+ports, private simulators. (Formerly firebase-ports.)
 
 A localhost daemon hands each CALLER its own emulator sandbox (a pool port block +
 fresh data) and reclaims it when the caller's process exits. No registry, no shared
@@ -37,7 +38,7 @@ independent suites, so they never collide on ports or data.
         record the nearest ancestor that DOES outlive the call (under an agent,
         the agent process) so the lease dies with that session; or --owner PID
         to name one yourself. Otherwise release it with
-        `firebase-ports release <leaseId>` or let the TTL reap it.
+        `harbormaster release <leaseId>` or let the TTL reap it.
         Any lease is also reaped once its --cwd stops existing — a deleted
         worktree can never need its Metro again.
   exec [--cwd DIR] [--only a,b] '<script>'
@@ -48,7 +49,7 @@ independent suites, so they never collide on ports or data.
   verify <leaseId>       Exit 0 iff the lease is FULLY alive: known to the daemon,
         its process running, its simulator still present, and (for booted suites)
         its ports open. The reuse gate for long-lived sessions:
-            firebase-ports verify "$FBPORTS_LEASE_ID" || <re-lease>
+            harbormaster verify "$FBPORTS_LEASE_ID" || <re-lease>
   serve                  Run the daemon (auto-starts on first command).
 
 NOTE: firebase.json ports are optional — the daemon injects (and overrides) a
@@ -70,9 +71,11 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
+# The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
+# in other projects must find the same ledger and daemon.
 STATE_DIR = Path(os.environ.get("FBPORTS_STATE_DIR",
                                 str(Path.home() / ".local" / "state" / "firebase-ports")))
 LEDGER = STATE_DIR / "ledger.json"
@@ -719,7 +722,7 @@ def cmd_serve():
                 pass
 
     threading.Thread(target=reaper, daemon=True).start()
-    print(f"firebase-ports {VERSION} daemon on http://{BROKER_HOST}:{BROKER_PORT} "
+    print(f"harbormaster {VERSION} daemon on http://{BROKER_HOST}:{BROKER_PORT} "
           f"(pool {POOL_BASE}-{POOL_BASE + POOL_BLOCKS * BLOCK - 1})", flush=True)
     srv.serve_forever()
 
@@ -785,7 +788,7 @@ def _ensure():
         if _up():
             raise RuntimeError(
                 f"daemon {v} is older than this client ({VERSION}) and did not "
-                f"shut down — kill the 'firebase-ports serve' process and retry")
+                f"shut down — kill the 'harbormaster serve' process and retry")
     _spawn_daemon()
     for _ in range(50):
         if _up():
@@ -948,7 +951,7 @@ def main():
             extra += f"  spawned pid {out['spawnedPid']}" if out.get("spawnedPid") else ""
             print(f"{out['leaseId']}  base {out['base']}{extra}")
     elif cmd == "exec":
-        # firebase-ports exec [--cwd DIR] [--only a,b] '<script>'
+        # harbormaster exec [--cwd DIR] [--only a,b] '<script>'
         # Reserve a free block from the daemon, then run `firebase emulators:exec`
         # on it (which boots the suite, sets FIRESTORE_EMULATOR_HOST etc. for the
         # script, and tears down). This is how projects should invoke emulators:exec
@@ -957,7 +960,7 @@ def main():
         cwd = _resolve_cwd(opts)
         script = " ".join(pos)
         if not script:
-            print("usage: firebase-ports exec [--cwd DIR] [--only a,b] '<script>'", file=sys.stderr)
+            print("usage: harbormaster exec [--cwd DIR] [--only a,b] '<script>'", file=sys.stderr)
             sys.exit(1)
         me = os.getpid()                      # this process owns the reservation for the run
         res = ok(_call("POST", "/allocate", {"owner_pid": me, "owner_start": _proc_start(me), "label": "exec"}), "exec")
@@ -983,7 +986,7 @@ def main():
         # gate for long-lived sessions (e2e Metro + sim): anything less than
         # fully alive means tear down what's left and re-lease.
         if not pos:
-            print("usage: firebase-ports verify <leaseId>", file=sys.stderr)
+            print("usage: harbormaster verify <leaseId>", file=sys.stderr)
             sys.exit(2)
         _ensure()                          # also upgrades an older daemon first
         out = _call("POST", "/verify", {"leaseId": pos[0]})[1]
