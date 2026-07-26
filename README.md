@@ -1,10 +1,5 @@
 # harbormaster
 
-> Formerly `firebase-ports`. The scope outgrew the name: leases now cover Metro/Expo
-> ports and private iOS simulators too, not just Firebase emulators. The npm package
-> still installs a `firebase-ports` bin alias, and the daemon state dir is unchanged,
-> so existing consumers keep working.
-
 A localhost daemon that leases each **caller** its own isolated port block — a
 Firebase emulator sandbox with fresh data, a Metro port, a private simulator —
 and reclaims it when the caller's process exits.
