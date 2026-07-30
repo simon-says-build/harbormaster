@@ -99,10 +99,38 @@ A lease is reclaimed when ANY of:
    daemon-booted suites and reserved (caller-booted) blocks. A single failed connect
    check on a loaded machine must never kill a healthy suite.
 
-Teardown always `killpg`s the whole process group so the emulator's **JVM children are
-reaped** — a v1 bug leaked Firestore/Storage JVMs because only the node parent was
-killed (verify this in v2). The daemon owns lifecycle end-to-end; callers use
-`acquire`/`release`, never `pkill`.
+Teardown frees the lease's **resources**, not just the process the daemon spawned —
+because the spawned process's group is provably not enough. v2 shipped assuming
+"`killpg` reaps the JVM children"; it doesn't: firebase-tools spawns its downloadable
+emulators and functions workers with `detached: true`, i.e. **their own process
+groups**, which `killpg` on the suite's group can structurally never reach. That
+false assumption leaked 51 Firestore JVMs and 284 functions workers on one machine
+before it was caught (2026-07-29). Teardown in v0.7 is therefore layered:
+
+1. `killpg` the recorded group (TERM → wait on **group** emptiness, not parent
+   death → KILL), guarded against PID reuse by the spawn-time start time.
+2. **Port sweep**: anything still LISTENing on any port of the lease's block is
+   killed (TERM → KILL). The block *is* the lease — this catches detached JVMs,
+   the caller's own Metro on the leased port, and anything else that squatted.
+3. Verify the block's ports are actually free, and log every action taken —
+   a teardown that leaves a listener behind says so instead of pretending.
+
+Beyond per-lease teardown, the daemon reconciles **both directions**: the ledger
+against the world (as before), and the world against the ledger — at startup and
+every `FBPORTS_SWEEP_INTERVAL` (300s) it evicts listeners on pool ports no lease
+covers, firebase-tools runtimes re-parented to pid 1 (the detached-children
+signature: `functionsEmulatorRuntime`, `cloud-firestore-emulator*.jar`, …), and
+`run-*`/`alloc-*` simulators with no lease. `harbormaster doctor [--fix]` runs the
+same sweep on demand. The daemon owns lifecycle end-to-end; callers use
+`acquire`/`release`, never `pkill` — and the sweep kills only by port ownership,
+pid-1 ancestry with our signatures, or our own sim naming scheme, never by name
+alone.
+
+The ledger itself is written atomically (temp + rename) and a corrupt ledger is
+quarantined loudly instead of silently zeroed — with the world sweep adopting
+whatever a lost ledger orphaned. Suites are registered in the ledger at spawn
+time (state `booting`), not after the readiness wait, so a daemon crash mid-boot
+can no longer strand a running suite outside the ledger.
 
 ## Owning PID is the caller, not the CLI
 
@@ -121,6 +149,7 @@ POST /heartbeat {leaseId, ttl?}                             -> {ok}          # e
 GET  /status                                               -> {leases:[...]}
 GET  /health
 POST /shutdown
+POST /doctor    {fix?}                                      -> {findings, fixed, leases}
 ```
 
 CLI: `acquire` / `up` (alias) / `down` (release your lease) / `release <id>` / `status`
@@ -141,6 +170,9 @@ eventarc=+8 database=+9` (kept in sync with the run driver's derivation).
 ## Open items before this goes live
 
 - Validate `acquire` boots + owner-death reap + PID-reuse guard on a quiet machine.
-- Confirm `killpg` reaps JVM children (fix the v1 leak if not).
+- ~~Confirm `killpg` reaps JVM children (fix the v1 leak if not).~~ Confirmed NOT
+  reaped (detached groups); fixed in v0.7 by the port sweep + world sweep, with
+  regression coverage in `test/e2e.sh` (release-path and crash-path both assert
+  the detached firestore JVM dies and the ports free).
 - Migrate the agent-qa run driver to pass `owner_pid` to `/allocate`.
 - Migrate the app.config / scrub-script / CLAUDE.md consumers to `acquire --env`.
