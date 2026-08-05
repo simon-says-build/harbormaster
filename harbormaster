@@ -1165,6 +1165,11 @@ def _print(out, fmt):
         if sim:
             print(f"export DETOX_UDID={sim['udid']}")          # Detox targets this simulator by UDID
             print(f"export DETOX_SIM_NAME={sim['name']}")
+        # The lease id, so a long-running caller can `harbormaster release` a
+        # suite it has decided is dead and re-acquire, instead of leaking it
+        # until the reaper notices.
+        if out.get("leaseId"):
+            print(f"export FBPORTS_LEASE_ID={out['leaseId']}")
     else:
         print(f"{out.get('leaseId', '')}  ({pid})".strip())
         for svc, port in ports.items():
