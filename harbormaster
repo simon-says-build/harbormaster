@@ -7,13 +7,17 @@ fresh data) and reclaims it when the caller's process exits. No registry, no sha
 per-project instances — two callers that both want "an impulse emulator" get two
 independent suites, so they never collide on ports or data.
 
-  acquire [--cwd DIR] [--owner PID] [--only a,b] [--ttl N] [--metro] [--sim] [--json|--env]
+  acquire [--cwd DIR] [--owner PID] [--only a,b] [--ttl N] [--metro] [--sim]
+          [--fn-env KEY=VAL ...] [--json|--env]
         Boot a private sandbox for the project in DIR (default: nearest firebase.json
         above $PWD). Owned by --owner (default: the calling process's parent), reaped
         when that process exits. Prints the ports (use --env to eval into your shell).
         --metro also reserves a Metro/Expo port (METRO_PORT). --sim also creates+boots
         a private iOS simulator (DETOX_UDID/DETOX_SIM_NAME) and implies --metro; the
-        sim is deleted when the lease is reaped. Tune with --sim-device / --sim-runtime
+        sim is deleted when the lease is reaped. --fn-env KEY=VAL (repeatable)
+        injects env into the spawned emulator process — the functions runtime
+        inherits it (e.g. LLM_CACHE_DIR for the e2e LLM fixture cache).
+        Tune with --sim-device / --sim-runtime
         (or FBPORTS_SIM_DEVICE / FBPORTS_SIM_RUNTIME). This is the e2e dev-env: one
         lease = emulators + metro port + simulator, all torn down when the owner exits.
   up ...                 Alias for acquire (interactive dev; owner = your shell).
@@ -76,7 +80,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -529,7 +533,7 @@ class Broker:
                 return base
         raise RuntimeError("emulator port pool exhausted")
 
-    def _boot(self, cwd, block, only, project_id, label, on_spawn=None):
+    def _boot(self, cwd, block, only, project_id, label, on_spawn=None, extra_env=None):
         all_ports = _block_ports(block)
         tmp = _write_injected_config(cwd, all_ports)
         # Readiness/liveness track ONLY the data services actually started (respect
@@ -544,8 +548,15 @@ class Broker:
             cmd += ["--only", ",".join(only)]
         if project_id:
             cmd += ["--project", project_id]
+        # Caller-supplied env (acquire --fn-env KEY=VAL) rides on top of the
+        # daemon's env — the functions emulator runtime inherits it, which is
+        # the only way a CALLER can set per-suite env (e.g. LLM_CACHE_DIR)
+        # when the daemon, not the caller, spawns the emulator.
+        spawn_env = None
+        if extra_env:
+            spawn_env = {**os.environ, **{str(k): str(v) for k, v in dict(extra_env).items()}}
         with open(log, "w") as lf:
-            proc = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True)
+            proc = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, env=spawn_env)
         if on_spawn:
             # Register the suite BEFORE the (up to 600s) readiness wait: a
             # daemon crash inside this window used to leave a fully-booted,
@@ -654,7 +665,7 @@ class Broker:
             print(f"teardown {lid}: " + "; ".join(actions), flush=True)
 
     def acquire(self, cwd, owner_pid, owner_start=None, only=None, ttl=DEFAULT_TTL,
-                metro=False, sim=False, sim_device=None, sim_runtime=None):
+                metro=False, sim=False, sim_device=None, sim_runtime=None, env=None):
         with self.lock:
             base = self._free_block()
             lid = f"run:{uuid.uuid4().hex[:12]}"
@@ -676,7 +687,8 @@ class Broker:
 
             try:
                 pid, tmp, log, ports, check = self._boot(
-                    cwd, base, only, project_id, lid.replace(":", "-"), on_spawn)
+                    cwd, base, only, project_id, lid.replace(":", "-"), on_spawn,
+                    extra_env=env)
             except Exception:
                 rec = self.leases.pop(lid, None)
                 if rec:
@@ -991,7 +1003,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._send(200, b.acquire(d["cwd"], d.get("owner_pid"), d.get("owner_start"),
                                                  d.get("only"), d.get("ttl", DEFAULT_TTL),
                                                  d.get("metro", False), d.get("sim", False),
-                                                 d.get("sim_device"), d.get("sim_runtime")))
+                                                 d.get("sim_device"), d.get("sim_runtime"),
+                                                 d.get("env")))
             if self.path == "/allocate":
                 return self._send(200, b.allocate(d.get("owner_pid"), d.get("owner_start"),
                                                   d.get("ttl", DEFAULT_TTL), d.get("label"),
@@ -1168,7 +1181,13 @@ def _parse(args):
         if a.startswith("--"):
             if "=" in a:
                 k, v = a[2:].split("=", 1)
-                opts[k] = v
+                if k == "fn-env":
+                    opts.setdefault("fn-env", []).append(v)
+                else:
+                    opts[k] = v
+            elif a[2:] == "fn-env" and i + 1 < len(args):
+                opts.setdefault("fn-env", []).append(args[i + 1])
+                i += 1
             elif a[2:] in ("cwd", "only", "ttl", "owner", "label", "sim-device", "sim-runtime", "spawn") and i + 1 < len(args):
                 opts[a[2:]] = args[i + 1]
                 i += 1
@@ -1208,7 +1227,8 @@ def main():
                                              "ttl": int(opts.get("ttl", DEFAULT_TTL)),
                                              "metro": "metro" in flags, "sim": "sim" in flags,
                                              "sim_device": opts.get("sim-device"),
-                                             "sim_runtime": opts.get("sim-runtime")}), "acquire"), fmt)
+                                             "sim_runtime": opts.get("sim-runtime"),
+                                             "env": dict(kv.split("=", 1) for kv in opts.get("fn-env", []))}), "acquire"), fmt)
     elif cmd == "down":
         if _up():
             out = _call("POST", "/release-owned", {"owner_pid": os.getppid(), "cwd": _resolve_cwd(opts)})[1]
