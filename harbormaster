@@ -80,7 +80,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.8.1"
+VERSION = "0.9.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -127,22 +127,48 @@ SWEEP_INTERVAL = int(os.environ.get("FBPORTS_SWEEP_INTERVAL", "300"))
 SWEEP_SIGNATURES = ("functionsEmulatorRuntime", "cloud-firestore-emulator",
                     "cloud-storage-rules-runtime", "pubsub-emulator",
                     "cloud-datastore-emulator", "firebase-database-emulator")
-# What the listener sweep may KILL. Everything a lease has ever put on a pool
-# port — firebase hubs and their JVMs, Metro/vite/dev servers, test drivers —
-# runs under node, java, or python. A listener that is none of those is a
-# bystander that happened to bind in-range (ollama's default 11434 sits inside
-# the default pool, and the sweep killed it on 2026-08-11), and killing
-# strangers is the pkill blast radius this tool exists to end. Bystanders are
-# still reported — a squatted block can't be leased, so doctor must show them —
-# but they are never signalled. The trade: an escapee from a LOST lease whose
-# --spawn was some other binary now outlives the sweep; report-only is the
-# right side of that trade.
-LEASE_SHAPES = ("node", "java", "python")
+# Authorship, not resemblance. v0.8.1 killed pool-port listeners that "looked
+# lease-shaped" (node/java/python) — a profile, and profiles convict bystanders
+# (0.8.0's broader rule killed ollama, whose 11434 sits inside the default
+# pool). The only honest kill test is "harbormaster started this", so that is
+# what gets recorded: while a lease's root process is alive, its detached
+# children still report it as ppid (setsid changes the group, not the parent),
+# and the reaper tick snapshots that descendant tree — (pid, start-time), start
+# checked again before any signal so a recycled pid is never a stranger's
+# death warrant. Teardown kills the recorded tree; the world sweep evicts only
+# what it can positively attribute: a recorded pid, or a cmdline naming the
+# injected config file harbormaster itself wrote (.firebase.brokered-*).
+# Everything else — signature-matched orphans included — is reported by
+# doctor and never signalled. The env-marker alternative is off the table on
+# macOS: KERN_PROCARGS2 hides other processes' environments even same-user.
+def _ps_table():
+    """{pid: (ppid, lstart)} for every visible process, one ps call."""
+    table = {}
+    try:
+        r = subprocess.run(["ps", "-axo", "pid=,ppid=,lstart="],
+                           capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            parts = line.split(None, 2)
+            if len(parts) == 3:
+                table[int(parts[0])] = (int(parts[1]), parts[2].strip())
+    except (subprocess.SubprocessError, OSError, ValueError):
+        pass
+    return table
 
 
-def _lease_shaped(cmdline):
-    exe = os.path.basename((cmdline.split() or [""])[0]).lower()
-    return exe.startswith(LEASE_SHAPES)
+def _descendants(root, table):
+    """{pid: lstart} of every process reachable from root via ppid edges."""
+    kids = {}
+    for pid, (ppid, _) in table.items():
+        kids.setdefault(ppid, []).append(pid)
+    out, frontier = {}, [int(root)]
+    while frontier:
+        p = frontier.pop()
+        for c in kids.get(p, ()):
+            if c not in out:
+                out[c] = table[c][1]
+                frontier.append(c)
+    return out
 
 
 def _now():
@@ -310,6 +336,30 @@ def _write_injected_config(cwd, ports):
     return tmp
 
 
+# Simulator authorship. run-*/alloc-* NAMING is not attribution: two daemons
+# on one machine (a test suite next to the production broker) each read the
+# other's sims as their own strays and delete them — observed 2026-08-12, the
+# production broker eating the e2e's fixtures within seconds. So every UDID
+# this daemon creates is recorded in its own file, SEPARATE from the ledger:
+# ledger loss must orphan leases, not attribution. Eviction requires the UDID
+# to be in this registry; a matching name alone is reported, never deleted.
+SIMS_FILE = STATE_DIR / "authored-sims.json"
+
+
+def _authored_sims():
+    try:
+        return set(json.loads(SIMS_FILE.read_text()))
+    except (OSError, json.JSONDecodeError):
+        return set()
+
+
+def _authored_sims_write(udids):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = SIMS_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(sorted(udids)))
+    tmp.replace(SIMS_FILE)
+
+
 def _sim_create_boot(device, runtime, name):
     """Create a fresh iOS simulator, boot it, and return its UDID. The device is
     per-lease (unique name) so concurrent e2e runs never share one; reaped on
@@ -319,6 +369,9 @@ def _sim_create_boot(device, runtime, name):
     if r.returncode != 0:
         raise RuntimeError(f"simctl create failed ({device} / {runtime}): {r.stderr.strip()}")
     udid = r.stdout.strip()
+    # Recorded before the boot: a crash mid-boot must still leave the device
+    # attributable, or nothing may ever delete it.
+    _authored_sims_write(_authored_sims() | {udid})
     # boot is idempotent-ish (errors if already booted); bootstatus waits until ready.
     subprocess.run(["xcrun", "simctl", "boot", udid], capture_output=True, text=True, timeout=120)
     subprocess.run(["xcrun", "simctl", "bootstatus", udid, "-b"], capture_output=True, text=True, timeout=300)
@@ -351,7 +404,10 @@ def _sim_teardown(udid):
         except (subprocess.SubprocessError, OSError):
             pass
     udids = _sim_udids()
-    return udids is None or udid not in udids
+    gone = udids is None or udid not in udids
+    if gone and udid in _authored_sims():
+        _authored_sims_write(_authored_sims() - {udid})
+    return gone
 
 
 def _sim_inventory():
@@ -471,7 +527,31 @@ class Broker:
             if reason:
                 print(f"reaping {lid}: {reason}", flush=True)
                 self._cleanup(self.leases.pop(lid))
+        self._record_trees()
         self._save()
+
+    def _record_trees(self):
+        """Every tick, note which processes each live lease's root has fathered.
+        This is the authorship ledger the teardown and sweep kill from: a
+        detached child keeps its ppid while the parent lives, so polling while
+        the suite is up sees the workers that killpg will later miss. Entries
+        accumulate across polls (a worker seen once is remembered after it
+        detaches); a recycled pid — same number, different start — is dropped,
+        never inherited."""
+        table = _ps_table()
+        if not table:
+            return
+        for rec in self.leases.values():
+            root = rec.get("pid")
+            if not root or root not in table:
+                continue
+            tree = rec.setdefault("tree", {})
+            for pid, start in _descendants(root, table).items():
+                tree[str(pid)] = start
+            for pid in list(tree):
+                live = table.get(int(pid))
+                if live and live[1] != tree[pid]:
+                    del tree[pid]              # recycled pid — a stranger now
         # Ledger-vs-world is only half the job: anything that escaped the
         # ledger (daemon crash mid-boot, corrupt ledger, detached children of
         # past suites) is invisible to the loop above and immortal without this.
@@ -655,6 +735,23 @@ class Broker:
                            ("SURVIVED kill" if _group_alive(pgid) else "killed"))
         else:
             reap_zombie()
+        # The recorded tree: children observed under the root while it lived,
+        # including the setsid'd workers the group kill above can never reach
+        # and non-listening processes the port sweep below can never see —
+        # functionsEmulatorRuntime leaked two per run through exactly that gap.
+        # Start-time is re-checked at kill time: a recycled pid is a stranger.
+        tree = rec.get("tree") or {}
+        strays = set()
+        for pid, start in tree.items():
+            pid = int(pid)
+            observed = _proc_start(pid)
+            if observed and observed == start:
+                strays.add(pid)
+        strays.discard(rec.get("pid"))
+        if strays:
+            killed = _kill_wave(strays)
+            if killed:
+                actions.append(f"tree sweep killed {sorted(killed)}")
         # Port sweep: every port the lease covers. rec["ports"] catches legacy
         # records; the block range catches everything else (metro, websocket).
         ports = {v for v in (rec.get("ports") or {}).values() if isinstance(v, int)}
@@ -856,6 +953,10 @@ class Broker:
                     # JVMs left zero trace. Every reap states its reason.
                     print(f"reaping {lid}: {reason}", flush=True)
                     self._cleanup(self.leases.pop(lid))
+            # Runs on the tick, not just at startup: the tree must be observed
+            # WHILE the parents live — after a root dies its detached children
+            # read ppid 1 and can never be attributed again.
+            self._record_trees()
             self._reap_deleted_sims(now)
             self._save()
             if now - getattr(self, "_swept", 0) >= SWEEP_INTERVAL:
@@ -920,11 +1021,34 @@ class Broker:
           functions workers whose suite died — killpg can never reach these);
         - harbormaster-named simulators (run-*/alloc-*) with no lease.
 
-        Scoped tightly on purpose: only pool ports, only this user's processes,
-        only pid-1 ancestry with firebase-tools signatures, only our own sim
-        naming scheme. Returns findings for `doctor`."""
+        Finding and killing are separate verdicts. Everything above is worth
+        REPORTING (a squatted block can't be leased; an orphaned JVM is a leak
+        whoever fathered it), but eviction requires positive attribution: the
+        pid appears in a live lease's recorded tree (start-time re-checked),
+        the cmdline names the .firebase.brokered-* config only harbormaster
+        writes, or the sim's UDID is in this daemon's authored-sims registry.
+        "Looks like it might have come from us" is not attribution — the
+        lease-shape rule killed ollama, and name-matching run-* sims had two
+        daemons on one box deleting each other's devices.
+        Returns findings for `doctor`."""
         findings = []
         lease_pids = {int(l["pid"]) for l in self.leases.values() if l.get("pid")}
+        # The authorship ledger: every (pid, start) any live lease's tree has
+        # recorded. Eviction requires membership here — start re-checked so a
+        # recycled pid never matches — or a cmdline that names the injected
+        # config file only harbormaster writes. Anything else is somebody
+        # else's process wearing a familiar name: reported, never signalled.
+        authored = {}
+        for l in self.leases.values():
+            for pid, start in (l.get("tree") or {}).items():
+                authored[int(pid)] = start
+
+        def _attributed(pid, cmdline=""):
+            if ".firebase.brokered-" in cmdline:
+                return True
+            start = authored.get(pid)
+            return bool(start) and _proc_start(pid) == start
+
         leased_ports = set()
         for l in self.leases.values():
             if l.get("block"):
@@ -936,7 +1060,7 @@ class Broker:
                     if pid not in lease_pids:
                         cmd = _proc_field(pid, "command=")[:200]
                         findings.append({"kind": "listener", "pid": pid, "port": port,
-                                         "cmd": cmd, "evict": _lease_shaped(cmd)})
+                                         "cmd": cmd, "evict": _attributed(pid, cmd)})
         try:
             r = subprocess.run(["ps", "-xo", "pid=,ppid=,command="],
                                capture_output=True, text=True, timeout=10)
@@ -950,36 +1074,48 @@ class Broker:
                 if (any(sig in cmdline for sig in SWEEP_SIGNATURES)
                         or ".firebase.brokered-" in cmdline):
                     findings.append({"kind": "orphan", "pid": pid,
-                                     "cmd": cmdline[:200]})
+                                     "cmd": cmdline[:200],
+                                     "evict": _attributed(pid, cmdline)})
         except (subprocess.SubprocessError, OSError, ValueError):
             pass
         inv = _sim_inventory()
         if inv is not None:
             leased_udids = {l.get("sim_udid") for l in self.leases.values()}
+            mine = _authored_sims()
             for udid, name in inv.items():
                 if ((name.startswith("run-") or name.startswith("alloc-"))
                         and udid not in leased_udids):
-                    findings.append({"kind": "sim", "udid": udid, "name": name})
+                    findings.append({"kind": "sim", "udid": udid, "name": name,
+                                     "evict": udid in mine})
         if apply and findings:
             pids = {f["pid"] for f in findings
-                    if f["kind"] == "orphan"
-                    or (f["kind"] == "listener" and f.get("evict"))}
+                    if f["kind"] in ("listener", "orphan") and f.get("evict")}
             if pids:
                 killed = _kill_wave(pids)
                 print(f"world sweep killed {killed}", flush=True)
             for f in findings:
-                if f["kind"] == "sim":
+                if f["kind"] == "sim" and f.get("evict"):
                     gone = _sim_teardown(f["udid"])
                     print(f"world sweep sim {f['name']} ({f['udid'][:8]}): "
                           + ("deleted" if gone else "DELETE FAILED"), flush=True)
-                elif f["kind"] == "listener" and not f.get("evict"):
-                    # Logged once per pid — a bystander survives every sweep by
-                    # design, and 288 identical lines a day is how logs go unread.
+                elif f["kind"] == "sim":
+                    seen = self.__dict__.setdefault("_bystanders_logged", set())
+                    if f["udid"] not in seen:
+                        seen.add(f["udid"])
+                        print(f"world sweep sim {f['name']} ({f['udid'][:8]}) left "
+                              f"alone (not provably ours — another daemon's?)",
+                              flush=True)
+                elif not f.get("evict"):
+                    # Logged once per pid — an unattributed finding survives
+                    # every sweep by design, and 288 identical lines a day is
+                    # how logs go unread.
                     seen = self.__dict__.setdefault("_bystanders_logged", set())
                     if f["pid"] not in seen:
                         seen.add(f["pid"])
-                        print(f"world sweep bystander on port {f['port']} left alone "
-                              f"(not lease-shaped): pid {f['pid']} — {f['cmd']}", flush=True)
+                        where = f" on port {f['port']}" if f.get("port") else ""
+                        print(f"world sweep {f['kind']}{where} left alone "
+                              f"(not provably ours): pid {f['pid']} — {f['cmd']}",
+                              flush=True)
                 else:
                     print(f"world sweep {f['kind']}: pid {f['pid']}"
                           + (f" port {f['port']}" if f.get("port") else "")
@@ -1366,23 +1502,24 @@ def main():
         if not findings:
             print(f"clean — {out.get('leases', 0)} lease(s), no strays.")
             return
-        spared = [f for f in findings if f["kind"] == "listener" and not f.get("evict", True)]
+        spared = [f for f in findings if not f.get("evict", True)]
         for f in findings:
+            tag = "  (not provably ours — never evicted)" if f in spared else ""
             if f["kind"] == "sim":
-                print(f"  stray sim    {f['name']}  {f['udid']}")
+                print(f"  stray sim    {f['name']}  {f['udid']}{tag}")
             else:
                 where = f" port {f['port']}" if f.get("port") else ""
-                tag = "  (bystander — never evicted)" if f in spared else ""
                 print(f"  {f['kind']:<12} pid {f['pid']}{where}  {f['cmd']}{tag}")
         evictable = len(findings) - len(spared)
         if out.get("fixed"):
             print(f"{evictable} finding(s) evicted."
-                  + (f" {len(spared)} bystander(s) left alone — they squat pool "
-                     f"ports harbormaster can't lease; move them or the pool."
-                     if spared else ""))
+                  + (f" {len(spared)} left alone — harbormaster only kills what "
+                     f"it can prove it authored; evict those by hand if they're "
+                     f"yours." if spared else ""))
         else:
             print(f"{len(findings)} finding(s) — run `harbormaster doctor --fix` to evict"
-                  + (f" ({len(spared)} bystander(s) will be left alone)." if spared else "."))
+                  + (f" ({len(spared)} not provably ours, will be left alone)."
+                     if spared else "."))
         if not out.get("fixed"):
             sys.exit(1)
     elif cmd in ("status", "leases"):

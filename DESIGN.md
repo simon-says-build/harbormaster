@@ -109,22 +109,38 @@ before it was caught (2026-07-29). Teardown in v0.7 is therefore layered:
 
 1. `killpg` the recorded group (TERM → wait on **group** emptiness, not parent
    death → KILL), guarded against PID reuse by the spawn-time start time.
-2. **Port sweep**: anything still LISTENing on any port of the lease's block is
+2. **Tree sweep** (v0.9): while a lease's root lives, its detached children
+   still report it as `ppid` — setsid changes the group, not the parent — so
+   the reaper tick records the observed descendant tree as `(pid, start-time)`
+   pairs in the ledger. Teardown kills the recorded tree, start re-checked at
+   kill time. This is what catches the non-listening functions workers that
+   the group kill structurally misses and the port sweep can't see.
+3. **Port sweep**: anything still LISTENing on any port of the lease's block is
    killed (TERM → KILL). The block *is* the lease — this catches detached JVMs,
    the caller's own Metro on the leased port, and anything else that squatted.
-3. Verify the block's ports are actually free, and log every action taken —
+4. Verify the block's ports are actually free, and log every action taken —
    a teardown that leaves a listener behind says so instead of pretending.
 
 Beyond per-lease teardown, the daemon reconciles **both directions**: the ledger
 against the world (as before), and the world against the ledger — at startup and
-every `FBPORTS_SWEEP_INTERVAL` (300s) it evicts listeners on pool ports no lease
-covers, firebase-tools runtimes re-parented to pid 1 (the detached-children
-signature: `functionsEmulatorRuntime`, `cloud-firestore-emulator*.jar`, …), and
-`run-*`/`alloc-*` simulators with no lease. `harbormaster doctor [--fix]` runs the
-same sweep on demand. The daemon owns lifecycle end-to-end; callers use
-`acquire`/`release`, never `pkill` — and the sweep kills only by port ownership,
-pid-1 ancestry with our signatures, or our own sim naming scheme, never by name
-alone.
+every `FBPORTS_SWEEP_INTERVAL` (300s) it looks for listeners on pool ports no
+lease covers, firebase-tools runtimes re-parented to pid 1 (the
+detached-children signature: `functionsEmulatorRuntime`,
+`cloud-firestore-emulator*.jar`, …), and `run-*`/`alloc-*` simulators with no
+lease. `harbormaster doctor [--fix]` runs the same sweep on demand.
+
+Finding and killing are separate verdicts (v0.9). Everything above is worth
+*reporting*, but the sweep evicts only what it can positively attribute to
+itself: a pid in a recorded lease tree (start-time re-checked), a cmdline
+naming the `.firebase.brokered-*` config only harbormaster writes, or a sim
+whose UDID is in the daemon's own `authored-sims.json` (written at create,
+kept separate from the ledger so a lost ledger orphans leases, not
+attribution). "Looks like it might have come from us" is not attribution —
+v0.8's lease-shaped heuristic killed a resident ollama whose default port sat
+inside the pool, and `run-*` name-matching had two daemons on one machine
+deleting each other's simulators. Unattributed findings are reported by
+`doctor` and never signalled; the daemon owns lifecycle end-to-end, callers
+use `acquire`/`release`, never `pkill`.
 
 The ledger itself is written atomically (temp + rename) and a corrupt ledger is
 quarantined loudly instead of silently zeroed — with the world sweep adopting

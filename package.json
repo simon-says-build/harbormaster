@@ -1,6 +1,6 @@
 {
   "name": "@simon-says-build/harbormaster",
-  "version": "0.8.1",
+  "version": "0.9.0",
   "description": "A localhost daemon that leases each caller its own port block — isolated Firebase emulator sandboxes, Metro/Expo ports, private iOS simulators — reaped when the caller exits. No port collisions, no shared instances, no pkill.",
   "bin": {
     "harbormaster": "harbormaster",
