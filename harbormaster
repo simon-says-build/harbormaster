@@ -80,7 +80,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.8.0"
+VERSION = "0.8.1"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -127,6 +127,22 @@ SWEEP_INTERVAL = int(os.environ.get("FBPORTS_SWEEP_INTERVAL", "300"))
 SWEEP_SIGNATURES = ("functionsEmulatorRuntime", "cloud-firestore-emulator",
                     "cloud-storage-rules-runtime", "pubsub-emulator",
                     "cloud-datastore-emulator", "firebase-database-emulator")
+# What the listener sweep may KILL. Everything a lease has ever put on a pool
+# port — firebase hubs and their JVMs, Metro/vite/dev servers, test drivers —
+# runs under node, java, or python. A listener that is none of those is a
+# bystander that happened to bind in-range (ollama's default 11434 sits inside
+# the default pool, and the sweep killed it on 2026-08-11), and killing
+# strangers is the pkill blast radius this tool exists to end. Bystanders are
+# still reported — a squatted block can't be leased, so doctor must show them —
+# but they are never signalled. The trade: an escapee from a LOST lease whose
+# --spawn was some other binary now outlives the sweep; report-only is the
+# right side of that trade.
+LEASE_SHAPES = ("node", "java", "python")
+
+
+def _lease_shaped(cmdline):
+    exe = os.path.basename((cmdline.split() or [""])[0]).lower()
+    return exe.startswith(LEASE_SHAPES)
 
 
 def _now():
@@ -918,8 +934,9 @@ class Broker:
             if POOL_BASE <= port < pool_end and port not in leased_ports:
                 for pid in pids:
                     if pid not in lease_pids:
+                        cmd = _proc_field(pid, "command=")[:200]
                         findings.append({"kind": "listener", "pid": pid, "port": port,
-                                         "cmd": _proc_field(pid, "command=")[:200]})
+                                         "cmd": cmd, "evict": _lease_shaped(cmd)})
         try:
             r = subprocess.run(["ps", "-xo", "pid=,ppid=,command="],
                                capture_output=True, text=True, timeout=10)
@@ -944,7 +961,9 @@ class Broker:
                         and udid not in leased_udids):
                     findings.append({"kind": "sim", "udid": udid, "name": name})
         if apply and findings:
-            pids = {f["pid"] for f in findings if f["kind"] in ("listener", "orphan")}
+            pids = {f["pid"] for f in findings
+                    if f["kind"] == "orphan"
+                    or (f["kind"] == "listener" and f.get("evict"))}
             if pids:
                 killed = _kill_wave(pids)
                 print(f"world sweep killed {killed}", flush=True)
@@ -953,6 +972,14 @@ class Broker:
                     gone = _sim_teardown(f["udid"])
                     print(f"world sweep sim {f['name']} ({f['udid'][:8]}): "
                           + ("deleted" if gone else "DELETE FAILED"), flush=True)
+                elif f["kind"] == "listener" and not f.get("evict"):
+                    # Logged once per pid — a bystander survives every sweep by
+                    # design, and 288 identical lines a day is how logs go unread.
+                    seen = self.__dict__.setdefault("_bystanders_logged", set())
+                    if f["pid"] not in seen:
+                        seen.add(f["pid"])
+                        print(f"world sweep bystander on port {f['port']} left alone "
+                              f"(not lease-shaped): pid {f['pid']} — {f['cmd']}", flush=True)
                 else:
                     print(f"world sweep {f['kind']}: pid {f['pid']}"
                           + (f" port {f['port']}" if f.get("port") else "")
@@ -1339,14 +1366,23 @@ def main():
         if not findings:
             print(f"clean — {out.get('leases', 0)} lease(s), no strays.")
             return
+        spared = [f for f in findings if f["kind"] == "listener" and not f.get("evict", True)]
         for f in findings:
             if f["kind"] == "sim":
                 print(f"  stray sim    {f['name']}  {f['udid']}")
             else:
                 where = f" port {f['port']}" if f.get("port") else ""
-                print(f"  {f['kind']:<12} pid {f['pid']}{where}  {f['cmd']}")
-        print(f"{len(findings)} finding(s) " +
-              ("evicted." if out.get("fixed") else "— run `harbormaster doctor --fix` to evict."))
+                tag = "  (bystander — never evicted)" if f in spared else ""
+                print(f"  {f['kind']:<12} pid {f['pid']}{where}  {f['cmd']}{tag}")
+        evictable = len(findings) - len(spared)
+        if out.get("fixed"):
+            print(f"{evictable} finding(s) evicted."
+                  + (f" {len(spared)} bystander(s) left alone — they squat pool "
+                     f"ports harbormaster can't lease; move them or the pool."
+                     if spared else ""))
+        else:
+            print(f"{len(findings)} finding(s) — run `harbormaster doctor --fix` to evict"
+                  + (f" ({len(spared)} bystander(s) will be left alone)." if spared else "."))
         if not out.get("fixed"):
             sys.exit(1)
     elif cmd in ("status", "leases"):

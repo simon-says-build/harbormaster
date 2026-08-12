@@ -32,6 +32,10 @@ if os.fork(): os._exit(0)
 os.setsid()
 s = socket.socket(); s.bind(("127.0.0.1", 15105)); s.listen()
 time.sleep(600)' &
+# A BYSTANDER on a pool port: nc is not node/java/python, so the sweep must
+# report it and refuse to kill it (the ollama-on-11434 case).
+nc -l 127.0.0.1 15107 >/dev/null 2>&1 &
+BYSTANDER=$!
 printf '#!/bin/sh\nsleep "$1"\n' > "$S/bin/functionsEmulatorRuntime"; chmod +x "$S/bin/functionsEmulatorRuntime"
 python3 -c "
 import os, sys
@@ -55,6 +59,7 @@ check "fake sim exists" bash -c "xcrun simctl list devices | grep -q run-sweepte
 OUT=$("$HM" doctor 2>&1); RC=$?
 echo "--- doctor output ---"; echo "$OUT"; echo "---"
 check "doctor reports pool listener" bash -c "echo '$OUT' | grep -q 'port 15105'"
+check "doctor reports bystander as such" bash -c "echo '$OUT' | grep 'port 15107' | grep -q 'bystander'"
 check "doctor reports orphan runtime" bash -c "echo '$OUT' | grep -q \"orphan.*pid $OPID\""
 check "doctor reports stray sim" bash -c "echo '$OUT' | grep -q 'run-sweeptest'"
 check "doctor exits 1 when unfixed" test "$RC" = "1"
@@ -64,6 +69,7 @@ check "fakes survive report-only doctor" kill -0 "$LPID"
 "$HM" doctor --fix >/dev/null 2>&1
 sleep 2
 check "listener evicted by fix" not kill -0 "$LPID"
+check "bystander survives fix" kill -0 "$BYSTANDER"
 check "orphan evicted by fix" not kill -0 "$OPID"
 check "stray sim deleted by fix" bash -c "! xcrun simctl list devices | grep -q run-sweeptest"
 
@@ -92,7 +98,7 @@ check "lease reaped after parent SIGKILL" python3 -c "import json,sys; sys.exit(
 check "orphaned java killed by port sweep" not kill -0 "$JAVA2"
 check "port freed after crash reap" bash -c "! lsof -ti tcp:$FSPORT2 -sTCP:LISTEN | grep -q ."
 
-kill "$OWNER" 2>/dev/null
+kill "$OWNER" "$BYSTANDER" 2>/dev/null
 curl -s -X POST localhost:5999/shutdown >/dev/null 2>&1
 sleep 1; kill "$DPID" 2>/dev/null
 echo "=== daemon log ==="
