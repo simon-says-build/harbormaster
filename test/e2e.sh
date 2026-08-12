@@ -23,7 +23,7 @@ not() { ! "$@"; }
 "$HM" serve > "$S/hm-test-daemon.log" 2>&1 &
 DPID=$!
 sleep 2
-check "daemon up, version 0.7.0" bash -c "curl -s localhost:5999/health | grep -q '0.7.0'"
+check "daemon up, version matches client" bash -c "curl -s localhost:5999/health | grep -qF \"$("$HM" version)\""
 
 # --- fabricate leaks ---
 python3 -c '
