@@ -72,6 +72,7 @@ import json
 import os
 import signal
 import socket
+import shutil
 import subprocess
 import sys
 import threading
@@ -80,7 +81,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.9.0"
+VERSION = "0.9.1"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -88,6 +89,9 @@ VERSION = "0.9.0"
 STATE_DIR = Path(os.environ.get("FBPORTS_STATE_DIR",
                                 str(Path.home() / ".local" / "state" / "firebase-ports")))
 LEDGER = STATE_DIR / "ledger.json"
+# Per-suite TMPDIR for the emulator process (see EmulatorPool._boot).
+def _suite_tmpdir(label):
+    return STATE_DIR / "tmp" / str(label)
 BROKER_HOST, BROKER_PORT = "127.0.0.1", int(os.environ.get("FBPORTS_PORT", "4999"))
 # Blocks of 20 ports, 11000-14999 by default. Overridable so an isolated test
 # daemon (FBPORTS_PORT + FBPORTS_STATE_DIR) can also use a DISJOINT pool — its
@@ -639,6 +643,18 @@ class Broker:
         run_ports = {s: all_ports[s] for s in (only or declared) if s in all_ports}
         check = {s: p for s, p in run_ports.items() if s not in ("ui", "hub", "logging")}
         log = STATE_DIR / f"{label}.log"
+        # Each suite gets its OWN temp dir. firebase-tools keeps the Storage
+        # emulator's blobs at `${os.tmpdir()}/firebase/storage/blobs` — one
+        # fixed path for every instance on the box — and `stop()` rm -rf's it.
+        # So any suite shutting down wiped the blobs of every other suite still
+        # running, and their next upload died with ENOENT inside firebase-tools
+        # ("An unexpected error has occurred.", exit 2, all emulators gone).
+        # On a box that runs several suites at once that is not a corner case:
+        # 2026-08-28, three walk2gether e2e runs in a row on the studio, each
+        # killed by a daemon verify drive finishing. os.tmpdir() honours
+        # TMPDIR, so a per-suite one makes the path private.
+        suite_tmp = _suite_tmpdir(label)
+        suite_tmp.mkdir(parents=True, exist_ok=True)
         cmd = ["firebase", "emulators:start", "--config", tmp]
         if only:
             cmd += ["--only", ",".join(only)]
@@ -648,9 +664,9 @@ class Broker:
         # daemon's env — the functions emulator runtime inherits it, which is
         # the only way a CALLER can set per-suite env (e.g. LLM_CACHE_DIR)
         # when the daemon, not the caller, spawns the emulator.
-        spawn_env = None
+        spawn_env = {**os.environ, "TMPDIR": str(suite_tmp)}
         if extra_env:
-            spawn_env = {**os.environ, **{str(k): str(v) for k, v in dict(extra_env).items()}}
+            spawn_env.update({str(k): str(v) for k, v in dict(extra_env).items()})
         with open(log, "w") as lf:
             proc = subprocess.Popen(cmd, cwd=cwd, stdout=lf, stderr=subprocess.STDOUT, start_new_session=True, env=spawn_env)
         if on_spawn:
@@ -770,6 +786,11 @@ class Broker:
         tmp = rec.get("tmp_config")
         if tmp and rec.get("cwd") and (Path(rec["cwd"]) / tmp).exists():
             (Path(rec["cwd"]) / tmp).unlink()
+        # The suite's private TMPDIR (see _boot). Derived from the label the
+        # same way _boot derived it, so old ledger records need no new field.
+        label = rec.get("label") or (Path(rec["log"]).stem if rec.get("log") else None)
+        if label:
+            shutil.rmtree(_suite_tmpdir(label), ignore_errors=True)
         if rec.get("sim_udid"):
             gone = _sim_teardown(rec["sim_udid"])
             actions.append(f"sim {rec['sim_udid'][:8]} " +
