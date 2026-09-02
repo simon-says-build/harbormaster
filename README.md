@@ -102,3 +102,15 @@ See [DESIGN.md](./DESIGN.md) for the full architecture.
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+## The daemon's environment is nobody's test environment
+
+The daemon is started by whichever client first needs it and would otherwise
+inherit that shell. Suites it boots inherit the daemon's environment (that is
+how `--fn-env` reaches the functions emulator runtime), so a variable exported
+by the first caller would reach every later caller's suite for the life of the
+daemon. Harbormaster therefore strips test-only and emulator-pointing variables
+(`TEST_NOW_MS`, `LLM_CACHE*`, `*_EMULATOR_HOST`, `*_EMULATOR_PORT`,
+`GCLOUD_PROJECT`, and the values a lease hands out) both when spawning the
+daemon and when it starts serving. A suite that needs one of these gets it
+explicitly: `acquire --fn-env TEST_NOW_MS=...`.

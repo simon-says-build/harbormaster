@@ -81,7 +81,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.9.1"
+VERSION = "0.9.2"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -1215,6 +1215,9 @@ class _Handler(http.server.BaseHTTPRequestHandler):
 
 def cmd_serve():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
+    dropped = _scrub_environ()
+    if dropped:
+        print(f"harbormaster: scrubbed inherited env before serving: {', '.join(dropped)}", flush=True)
     _Handler.broker = Broker()
     srv = http.server.ThreadingHTTPServer((BROKER_HOST, BROKER_PORT), _Handler)
 
@@ -1267,10 +1270,58 @@ def _ver_tuple(v):
         return (0,)
 
 
+# THE DAEMON'S ENVIRONMENT IS NOBODY'S TEST ENVIRONMENT.
+#
+# The daemon is started by whichever client first needs it, and inherits that
+# client's shell. Every suite it boots then inherits the daemon's environment
+# (`_boot`: {**os.environ, ...}), because that is how the functions emulator
+# runtime gets the env a caller passes with --fn-env. So a variable exported
+# by the FIRST caller reaches every LATER caller's suite, for the life of the
+# daemon — and nothing shows it.
+#
+# 2026-09-02: a session-test run (TEST_NOW_MS=1784000000000, LLM_CACHE=1
+# exported) started the daemon at 07:04. Every native e2e suite booted after
+# that ran its functions emulator on a clock frozen at 2026-07-13; the app
+# created its onboarding session with that date, decided the session was
+# seven weeks old and not editable, and hid the composer. The onboarding gate
+# spec failed on every PR for the rest of the day, and the diagnosis took
+# hours because the only trace was a date inside one Firestore document.
+#
+# So: anything test-only, anything that points at an emulator, and anything a
+# lease hands out is stripped from the daemon's own environment — when a
+# client spawns it AND when it starts serving (a daemon started by hand from a
+# test shell is the same hazard). A caller that wants a suite to see such a
+# variable passes it explicitly with --fn-env, which rides on top of this.
+SCRUB_EXACT = {
+    "TEST_NOW_MS",
+    "GCLOUD_PROJECT", "FIREBASE_CONFIG", "FUNCTIONS_EMULATOR",
+    "FBPORTS_LEASE_ID", "FBPORTS_BLOCK_BASE",
+    "METRO_PORT", "DETOX_UDID", "DETOX_SIM_NAME", "AGENT_SIM_UDID",
+}
+SCRUB_PREFIXES = ("LLM_CACHE", "EMULATOR_")
+SCRUB_SUFFIXES = ("_EMULATOR_HOST", "_EMULATOR_PORT")
+
+
+def scrub_key(k):
+    return (k in SCRUB_EXACT or k.startswith(SCRUB_PREFIXES) or k.endswith(SCRUB_SUFFIXES))
+
+
+def scrubbed_env(env):
+    return {k: v for k, v in env.items() if not scrub_key(k)}
+
+
+def _scrub_environ():
+    dropped = sorted(k for k in os.environ if scrub_key(k))
+    for k in dropped:
+        del os.environ[k]
+    return dropped
+
+
 def _spawn_daemon():
     STATE_DIR.mkdir(parents=True, exist_ok=True)
     log = open(STATE_DIR / "daemon.log", "a")
-    subprocess.Popen([sys.argv[0], "serve"], stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
+    subprocess.Popen([sys.argv[0], "serve"], stdout=log, stderr=subprocess.STDOUT,
+                     start_new_session=True, env=scrubbed_env(os.environ))
 
 
 def _ensure():
