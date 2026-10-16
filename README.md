@@ -137,3 +137,20 @@ stale marker means the service is gone, and clients spawn as before. Without
 this, the broker belonged to whichever client happened to start it: on
 simon-linux-1 that was a CI job, whose orphan cleanup killed the broker and
 every emulator it ran for other jobs mid-suite. `python3 test/managed.py`.
+
+## A project's own suite env (0.12.0)
+
+`--fn-env` is per caller, so a setting every suite of a project needs had to
+be repeated by every caller (session tests, e2e, agent runs), and the one that
+forgot ran against production. A project now names it once, in
+`harbormaster.env` next to its `firebase.json`:
+
+    # every emulator suite of this project runs under the TEST service account
+    GOOGLE_APPLICATION_CREDENTIALS=./impulse-test-bq.json
+
+`KEY=VALUE` lines, `#` comments. A value starting with `./` or `../` is made
+absolute against the project, since the emulator runs functions (and
+extensions) in other directories. `acquire`: on top of the daemon's scrubbed
+env, under the caller's explicit `--fn-env`. `exec`: on top of the caller's
+ambient env, so a key exported in some shell can't leak into the suite.
+`python3 test/project_env.py`.
