@@ -84,7 +84,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.11.1"
+VERSION = "0.12.0"
 
 # Overridable for tests / parallel installs; default is the shared user daemon.
 # The dir keeps the old "firebase-ports" name: pre-rename binaries still installed
@@ -699,7 +699,7 @@ class Broker:
         # daemon's env — the functions emulator runtime inherits it, which is
         # the only way a CALLER can set per-suite env (e.g. LLM_CACHE_DIR)
         # when the daemon, not the caller, spawns the emulator.
-        spawn_env = {**os.environ, "TMPDIR": str(suite_tmp)}
+        spawn_env = {**os.environ, **project_env(cwd), "TMPDIR": str(suite_tmp)}
         if extra_env:
             spawn_env.update({str(k): str(v) for k, v in dict(extra_env).items()})
         with open(log, "w") as lf:
@@ -1333,6 +1333,46 @@ def _daemon_version():
         return None
 
 
+# A PROJECT'S OWN SUITE ENV: <cwd>/harbormaster.env.
+#
+# --fn-env is per CALLER, so a setting every suite of a project needs (the
+# credentials its emulator must run under, say) had to be repeated by every
+# caller — session tests, e2e, agent runs — and the one that forgot ran
+# against production. impulse-functions (2026-10-16): its BigQuery export
+# extensions run under the Extensions emulator and stream to whatever project
+# the ambient credentials can reach; only a test service account keeps that
+# test-only. So the project names it once, in the repo:
+#
+#   # harbormaster.env, next to firebase.json
+#   GOOGLE_APPLICATION_CREDENTIALS=./impulse-test-bq.json
+#
+# KEY=VALUE lines; blank lines and `#` comments skipped; a value starting
+# with ./ or ../ is a path relative to the project, made absolute (the
+# emulator's functions run in other directories). acquire: on top of the
+# daemon's (scrubbed) env, UNDER the caller's explicit --fn-env. exec: on top
+# of the caller's ambient env, which is not a choice. Pure; missing file = {}.
+PROJECT_ENV_FILE = "harbormaster.env"
+
+
+def project_env(cwd):
+    f = Path(cwd) / PROJECT_ENV_FILE
+    if not f.is_file():
+        return {}
+    out = {}
+    for raw in f.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        k, v = k.strip(), v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+            v = v[1:-1]
+        if v.startswith("./") or v.startswith("../"):
+            v = str((Path(cwd) / v).resolve())
+        out[k] = v
+    return out
+
+
 def _ver_tuple(v):
     try:
         return tuple(int(x) for x in str(v).split("."))
@@ -1626,7 +1666,10 @@ def main():
             if only:
                 run += ["--only", ",".join(only)]
             run.append(script)
-            rc = subprocess.call(run, cwd=cwd)
+            # The project's env beats the caller's AMBIENT env here: a key
+            # exported in some shell for a one-off script is exactly what
+            # harbormaster.env exists to keep out of the suite (project_env).
+            rc = subprocess.call(run, cwd=cwd, env={**os.environ, **project_env(cwd)})
         finally:
             try:
                 _call("POST", "/release", {"leaseId": lid})
